@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NetWatch Light</title>
+    <link rel="stylesheet" href="/assets/styles.css?v=single-code-layer-1" />
+  </head>
+  <body class="presentation-mode is-home">
+    <div class="presentation-shell" id="presentationShell">
+      <nav class="landing-nav" aria-label="Landing navigation">
+        <button class="landing-logo" type="button" data-view-target="home" aria-label="Home">
+          <img src="/assets/media/logo.png" alt="" />
+        </button>
+        <button class="landing-link" type="button" data-view-target="topology">Map</button>
+        <button class="landing-link" type="button" data-view-target="devices">Monitor</button>
+        <button class="landing-cta" type="button" data-view-target="dashboard">Get Started</button>
+      </nav>
+
+      <section class="landing-view" data-view-panel="home" aria-label="NetWatch landing page">
+      <div class="landing-copy">
+        <h1 class="landing-title" data-letterize="true">
+          <span>Let's Monitor</span>
+          <span>Your Network</span>
+        </h1>
+        <button class="landing-start" type="button" data-view-target="dashboard">Get Started</button>
+      </div>
+
+        <p class="landing-credit">&copy; VaVa 2026. Tools for creative technology</p>
+      </section>
+
+      <section class="map-showcase" id="topologyShowcase" aria-label="Network topology map">
+        <canvas class="dot-tunnel-canvas" id="dotTunnelCanvas" aria-hidden="true"></canvas>
+        <div class="showcase-map" id="showcaseMap">
+          <svg class="showcase-link-layer" id="showcaseLinkLayer" aria-hidden="true"></svg>
+          <div class="showcase-node-layer" id="showcaseNodeLayer"></div>
+        </div>
+      </section>
+
+      <section class="pattern-break" id="patternBreak" aria-label="Pattern transition">
+        <img src="/assets/media/sarah-morris-2.png" alt="" />
+      </section>
+
+      <section class="dashboard-showcase" id="presentationDashboard" aria-label="Network dashboard">
+        <button class="dashboard-run-poll" id="presentationRunPoll" type="button">
+          <span>Run Poll</span>
+        </button>
+
+        <aside class="dashboard-live">
+          <span>Worker Events</span>
+          <h2>Live Streams</h2>
+          <ol id="presentationEventList"></ol>
+        </aside>
+
+        <div class="dashboard-card-row" id="presentationDashboardCards"></div>
+      </section>
+
+      <div class="landing-media" aria-hidden="true">
+        <div class="landing-code">
+          <img class="landing-code-image landing-code-bw" src="/assets/media/code-bw.png" alt="" />
+          <img class="landing-code-image landing-code-color" src="/assets/media/code-3.png" alt="" />
+        </div>
+        <div class="landing-pattern">
+          <img src="/assets/media/sarah-morris-5.png" alt="" />
+        </div>
+      </div>
+    </div>
+
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Navigazione principale">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">N</div>
+          <div>
+            <strong>NetWatch</strong>
+            <span>Light app</span>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item is-active" type="button" data-view="dashboard" data-testid="nav-dashboard">
+            <span class="nav-icon" aria-hidden="true">01</span>
+            Dashboard
+          </button>
+          <button class="nav-item" type="button" data-view="devices" data-testid="nav-devices">
+            <span class="nav-icon" aria-hidden="true">02</span>
+            Devices
+          </button>
+          <button class="nav-item" type="button" data-view="topology" data-testid="nav-topology">
+            <span class="nav-icon" aria-hidden="true">03</span>
+            Topology
+          </button>
+          <button class="nav-item" type="button" data-view="alerts" data-testid="nav-alerts">
+            <span class="nav-icon" aria-hidden="true">04</span>
+            Alerts
+          </button>
+          <button class="nav-item" type="button" data-view="settings" data-testid="nav-settings">
+            <span class="nav-icon" aria-hidden="true">05</span>
+            Settings
+          </button>
+        </nav>
+
+        <div class="session-card">
+          <span class="eyebrow">Backend</span>
+          <strong id="backendState">Connecting</strong>
+          <span id="eventStreamState">WebSocket pending</span>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="viewEyebrow">Current network state</p>
+            <h1 id="viewTitle">Dashboard</h1>
+          </div>
+          <div class="topbar-actions">
+            <button class="ghost-button" type="button" id="runPollButton" data-testid="run-poll-button">Run poll</button>
+            <button class="primary-button" type="button" id="runDiscoveryButton" data-testid="run-discovery-button">Run LLDP discovery</button>
+          </div>
+        </header>
+
+        <section class="view is-active" data-view-panel="dashboard" aria-labelledby="viewTitle">
+          <div class="kpi-grid" id="kpiGrid"></div>
+          <div class="content-grid">
+            <section class="panel wide-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Devices</span>
+                  <h2>Current state</h2>
+                </div>
+                <span class="status-pill neutral">FastAPI light backend</span>
+              </div>
+              <div class="device-list" id="dashboardDeviceList"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Worker events</span>
+                  <h2>Live stream</h2>
+                </div>
+              </div>
+              <ol class="event-list" id="eventList"></ol>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="devices">
+          <div class="split-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Inventory</span>
+                  <h2>Managed devices</h2>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>IP</th>
+                      <th>Vendor</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="devicesTable"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel detail-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Device detail</span>
+                  <h2 id="deviceDetailTitle">Select a device</h2>
+                </div>
+              </div>
+              <div id="deviceDetail"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="topology">
+          <section class="topology-workspace">
+            <div class="topology-toolbar">
+              <div>
+                <span class="eyebrow">LLDP topology</span>
+                <h2>Confirmed and pending links</h2>
+              </div>
+              <div class="legend">
+                <span><i class="legend-line solid"></i>confirmed</span>
+                <span><i class="legend-line dashed"></i>pending</span>
+                <span><i class="legend-dot warning"></i>alert</span>
+              </div>
+            </div>
+            <div class="topology-canvas" id="topologyCanvas" data-testid="topology-canvas">
+              <svg class="link-layer" id="linkLayer" aria-hidden="true"></svg>
+              <div class="node-layer" id="nodeLayer"></div>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-view-panel="alerts">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <span class="eyebrow">Static thresholds</span>
+                <h2>Alert lifecycle</h2>
+              </div>
+              <span class="status-pill neutral">active / acknowledged / resolved</span>
+            </div>
+            <div class="alert-list" id="alertList"></div>
+          </section>
+        </section>
+
+        <section class="view" data-view-panel="settings">
+          <div class="settings-grid">
+            <section class="panel wide-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Live Seed Discovery</span>
+                  <h2>Connect a real FS switch</h2>
+                </div>
+                <span class="status-pill neutral" id="liveModeBadge">mock mode</span>
+              </div>
+              <form class="seed-form" id="seedForm" data-testid="seed-form">
+                <label>
+                  <span>Seed IP</span>
+                  <input id="seedHost" name="host" type="text" placeholder="10.10.0.2" autocomplete="off" required />
+                </label>
+                <label>
+                  <span>Port</span>
+                  <input id="seedPort" name="port" type="number" min="1" max="65535" value="161" required />
+                </label>
+                <label>
+                  <span>SNMP version</span>
+                  <select id="seedVersion" name="version">
+                    <option value="2c">v2c</option>
+                    <option value="3">v3</option>
+                  </select>
+                </label>
+                <label class="v2-field">
+                  <span>Read-only community</span>
+                  <input id="seedCommunity" name="community" type="password" placeholder="NETWATCH_RO" autocomplete="off" />
+                </label>
+                <label class="v3-field">
+                  <span>Username</span>
+                  <input id="seedUsername" name="username" type="text" autocomplete="off" />
+                </label>
+                <label class="v3-field">
+                  <span>Auth key</span>
+                  <input id="seedAuthKey" name="authKey" type="password" autocomplete="off" />
+                </label>
+                <label class="v3-field">
+                  <span>Priv key</span>
+                  <input id="seedPrivKey" name="privKey" type="password" autocomplete="off" />
+                </label>
+                <label class="v3-field">
+                  <span>Auth protocol</span>
+                  <select id="seedAuthProtocol" name="authProtocol">
+                    <option value="SHA">SHA</option>
+                    <option value="MD5">MD5</option>
+                    <option value="NONE">None</option>
+                  </select>
+                </label>
+                <label class="v3-field">
+                  <span>Priv protocol</span>
+                  <select id="seedPrivProtocol" name="privProtocol">
+                    <option value="AES">AES</option>
+                    <option value="DES">DES</option>
+                    <option value="NONE">None</option>
+                  </select>
+                </label>
+                <div class="seed-actions">
+                  <button class="ghost-button" type="button" id="clearLiveButton">Clear mock data</button>
+                  <button class="primary-button" type="submit" id="seedSubmitButton" data-testid="seed-submit-button">Test and import seed</button>
+                </div>
+                <label class="seed-toggle">
+                  <input id="autoPollToggle" type="checkbox" checked />
+                  <span>Auto live poll every 30 seconds after seed import</span>
+                </label>
+              </form>
+              <p class="seed-result" id="seedResult">Credentials are used for this request only and are not stored in the light app.</p>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Polling</span>
+                  <h2>Worker defaults</h2>
+                </div>
+              </div>
+              <dl class="settings-list" id="pollingSettings"></dl>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Security</span>
+                  <h2>Secrets and writes</h2>
+                </div>
+              </div>
+              <dl class="settings-list" id="securitySettings"></dl>
+            </section>
+
+            <section class="panel wide-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Catalog</span>
+                  <h2>MVP metrics</h2>
+                </div>
+              </div>
+              <div class="metric-catalog" id="metricCatalog"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/assets/app.js?v=single-code-layer-1" defer></script>
+  </body>
+</html>

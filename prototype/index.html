@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NetWatch MVP Prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Navigazione principale">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">N</div>
+          <div>
+            <strong>NetWatch</strong>
+            <span>MVP console</span>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item is-active" type="button" data-view="dashboard" data-testid="nav-dashboard">
+            <span class="nav-icon" aria-hidden="true">01</span>
+            Dashboard
+          </button>
+          <button class="nav-item" type="button" data-view="devices" data-testid="nav-devices">
+            <span class="nav-icon" aria-hidden="true">02</span>
+            Devices
+          </button>
+          <button class="nav-item" type="button" data-view="topology" data-testid="nav-topology">
+            <span class="nav-icon" aria-hidden="true">03</span>
+            Topology
+          </button>
+          <button class="nav-item" type="button" data-view="alerts" data-testid="nav-alerts">
+            <span class="nav-icon" aria-hidden="true">04</span>
+            Alerts
+          </button>
+          <button class="nav-item" type="button" data-view="settings" data-testid="nav-settings">
+            <span class="nav-icon" aria-hidden="true">05</span>
+            Settings
+          </button>
+        </nav>
+
+        <div class="session-card">
+          <span class="eyebrow">Write session</span>
+          <strong>Setup token</strong>
+          <span>expires in <b id="sessionTimer">60:00</b></span>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="viewEyebrow">Current network state</p>
+            <h1 id="viewTitle">Dashboard</h1>
+          </div>
+          <div class="topbar-actions">
+            <button class="ghost-button" type="button" id="runPollButton" data-testid="run-poll-button">Run poll</button>
+            <button class="primary-button" type="button" id="runDiscoveryButton" data-testid="run-discovery-button">Run LLDP discovery</button>
+          </div>
+        </header>
+
+        <section class="view is-active" data-view-panel="dashboard" aria-labelledby="viewTitle">
+          <div class="kpi-grid" id="kpiGrid"></div>
+
+          <div class="content-grid">
+            <section class="panel wide-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Devices</span>
+                  <h2>Current state</h2>
+                </div>
+                <span class="status-pill neutral">SNMP only</span>
+              </div>
+              <div class="device-list" id="dashboardDeviceList"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Worker</span>
+                  <h2>Recent events</h2>
+                </div>
+              </div>
+              <ol class="event-list" id="eventList"></ol>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="devices">
+          <div class="split-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Inventory</span>
+                  <h2>Managed devices</h2>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>IP</th>
+                      <th>Vendor</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="devicesTable"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel detail-panel" id="deviceDetailPanel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Device detail</span>
+                  <h2 id="deviceDetailTitle">Select a device</h2>
+                </div>
+              </div>
+              <div id="deviceDetail"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="topology">
+          <section class="topology-workspace">
+            <div class="topology-toolbar">
+              <div>
+                <span class="eyebrow">LLDP topology</span>
+                <h2>Confirmed and pending links</h2>
+              </div>
+              <div class="legend">
+                <span><i class="legend-line solid"></i>confirmed</span>
+                <span><i class="legend-line dashed"></i>pending</span>
+                <span><i class="legend-dot warning"></i>alert</span>
+              </div>
+            </div>
+            <div class="topology-canvas" id="topologyCanvas" data-testid="topology-canvas">
+              <svg class="link-layer" id="linkLayer" aria-hidden="true"></svg>
+              <div class="node-layer" id="nodeLayer"></div>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-view-panel="alerts">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <span class="eyebrow">Static thresholds</span>
+                <h2>Alert lifecycle</h2>
+              </div>
+              <span class="status-pill neutral">active / acknowledged / resolved</span>
+            </div>
+            <div class="alert-list" id="alertList"></div>
+          </section>
+        </section>
+
+        <section class="view" data-view-panel="settings">
+          <div class="settings-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Polling</span>
+                  <h2>Worker defaults</h2>
+                </div>
+              </div>
+              <dl class="settings-list">
+                <div><dt>Status</dt><dd>30 seconds</dd></div>
+                <div><dt>Traffic</dt><dd>60 seconds</dd></div>
+                <div><dt>Inventory</dt><dd>15 minutes</dd></div>
+                <div><dt>Concurrency</dt><dd>50 global, 2 per device</dd></div>
+                <div><dt>GETBULK</dt><dd>adaptive, starts at 25</dd></div>
+              </dl>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Security</span>
+                  <h2>Secrets and writes</h2>
+                </div>
+              </div>
+              <dl class="settings-list">
+                <div><dt>Credentials</dt><dd>encrypted in DB</dd></div>
+                <div><dt>Master key</dt><dd>Docker secret file</dd></div>
+                <div><dt>DEK</dt><dd>one per credential</dd></div>
+                <div><dt>Write API</dt><dd>session cookie + CSRF</dd></div>
+                <div><dt>Session</dt><dd>1 hour</dd></div>
+              </dl>
+            </section>
+
+            <section class="panel wide-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="eyebrow">Catalog</span>
+                  <h2>MVP metrics</h2>
+                </div>
+              </div>
+              <div class="metric-catalog" id="metricCatalog"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,1 @@
+"""Lightweight NetWatch application package."""
