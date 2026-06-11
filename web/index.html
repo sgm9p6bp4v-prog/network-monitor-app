@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NetWatch Light</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=single-code-layer-1" />
+    <link rel="stylesheet" href="/assets/styles.css?v=dashboard-actions-1" />
   </head>
   <body class="presentation-mode is-home">
     <div class="presentation-shell" id="presentationShell">
@@ -31,9 +31,15 @@
 
       <section class="map-showcase" id="topologyShowcase" aria-label="Network topology map">
         <canvas class="dot-tunnel-canvas" id="dotTunnelCanvas" aria-hidden="true"></canvas>
+        <div class="showcase-map-controls" aria-label="Map zoom controls">
+          <button class="showcase-zoom-button" type="button" id="showcaseZoomIn" aria-label="Zoom in map">+</button>
+          <button class="showcase-zoom-button" type="button" id="showcaseZoomOut" aria-label="Zoom out map">-</button>
+        </div>
         <div class="showcase-map" id="showcaseMap">
-          <svg class="showcase-link-layer" id="showcaseLinkLayer" aria-hidden="true"></svg>
-          <div class="showcase-node-layer" id="showcaseNodeLayer"></div>
+          <div class="showcase-map-plane" id="showcaseMapPlane">
+            <svg class="showcase-link-layer" id="showcaseLinkLayer" aria-hidden="true"></svg>
+            <div class="showcase-node-layer" id="showcaseNodeLayer"></div>
+          </div>
         </div>
       </section>
 
@@ -42,9 +48,18 @@
       </section>
 
       <section class="dashboard-showcase" id="presentationDashboard" aria-label="Network dashboard">
-        <button class="dashboard-run-poll" id="presentationRunPoll" type="button">
-          <span>Run Poll</span>
-        </button>
+        <div class="dashboard-action-row" aria-label="Dashboard actions">
+          <button class="dashboard-action-button dashboard-run-poll" id="presentationRunPoll" type="button">
+            <span>Run Poll</span>
+          </button>
+          <button class="dashboard-action-button dashboard-seed-button" id="presentationSetupButton" type="button">
+            <span>SNMP Seed</span>
+          </button>
+          <button class="dashboard-action-button dashboard-clear-button" id="presentationClearAllButton" type="button">
+            <span>Clear All</span>
+          </button>
+        </div>
+        <span class="dashboard-seed-summary" id="presentationSeedSummary">mock mode</span>
 
         <aside class="dashboard-live">
           <span>Worker Events</span>
@@ -55,6 +70,22 @@
         <div class="dashboard-card-row" id="presentationDashboardCards"></div>
       </section>
 
+      <section class="devices-showcase" id="presentationDevices" aria-label="Managed devices">
+        <header class="devices-showcase-header">
+          <span>Managed Inventory</span>
+          <h2>Every switch, every interface, in view.</h2>
+        </header>
+
+        <div class="devices-carousel" id="devicesCarousel">
+          <div class="devices-track" id="devicesTrack"></div>
+        </div>
+
+        <div class="devices-carousel-controls" aria-label="Device navigation">
+          <button class="devices-arrow" type="button" id="devicePrevButton" aria-label="Previous device">←</button>
+          <button class="devices-arrow" type="button" id="deviceNextButton" aria-label="Next device">→</button>
+        </div>
+      </section>
+
       <div class="landing-media" aria-hidden="true">
         <div class="landing-code">
           <img class="landing-code-image landing-code-bw" src="/assets/media/code-bw.png" alt="" />
@@ -63,6 +94,82 @@
         <div class="landing-pattern">
           <img src="/assets/media/sarah-morris-5.png" alt="" />
         </div>
+      </div>
+
+      <div class="live-setup-modal" id="liveSetupModal" hidden>
+        <button class="live-setup-backdrop" id="liveSetupBackdrop" type="button" aria-label="Close setup"></button>
+        <section class="live-setup-card" role="dialog" aria-modal="true" aria-labelledby="liveSetupTitle">
+          <header class="live-setup-head">
+            <div>
+              <span>Live Seed Discovery</span>
+              <h2 id="liveSetupTitle">Connect FS switch</h2>
+            </div>
+            <button class="live-setup-close" id="liveSetupClose" type="button" aria-label="Close setup">×</button>
+          </header>
+
+          <form class="seed-form presentation-seed-form" id="presentationSeedForm">
+            <label>
+              <span>Seed IP</span>
+              <input id="presentationSeedHost" name="host" type="text" placeholder="10.10.0.2" autocomplete="off" required />
+            </label>
+            <label>
+              <span>Port</span>
+              <input id="presentationSeedPort" name="port" type="number" min="1" max="65535" value="161" required />
+            </label>
+            <label>
+              <span>SNMP version</span>
+              <select id="presentationSeedVersion" name="version">
+                <option value="2c">v2c</option>
+                <option value="3">v3</option>
+              </select>
+            </label>
+            <label class="presentation-v2-field">
+              <span>Read-only community</span>
+              <input id="presentationSeedCommunity" name="community" type="password" placeholder="NETWATCH_RO" autocomplete="off" />
+            </label>
+            <label class="presentation-v3-field">
+              <span>Username</span>
+              <input id="presentationSeedUsername" name="username" type="text" autocomplete="off" />
+            </label>
+            <label class="presentation-v3-field">
+              <span>Auth key</span>
+              <input id="presentationSeedAuthKey" name="authKey" type="password" autocomplete="off" />
+            </label>
+            <label class="presentation-v3-field">
+              <span>Priv key</span>
+              <input id="presentationSeedPrivKey" name="privKey" type="password" autocomplete="off" />
+            </label>
+            <label class="presentation-v3-field">
+              <span>Auth protocol</span>
+              <select id="presentationSeedAuthProtocol" name="authProtocol">
+                <option value="SHA">SHA</option>
+                <option value="MD5">MD5</option>
+                <option value="NONE">None</option>
+              </select>
+            </label>
+            <label class="presentation-v3-field">
+              <span>Priv protocol</span>
+              <select id="presentationSeedPrivProtocol" name="privProtocol">
+                <option value="AES">AES</option>
+                <option value="DES">DES</option>
+                <option value="NONE">None</option>
+              </select>
+            </label>
+            <label>
+              <span>Poll seconds</span>
+              <input id="presentationPollInterval" type="number" min="5" max="3600" value="30" />
+            </label>
+            <label class="seed-toggle presentation-seed-toggle">
+              <input id="presentationBackendPollToggle" type="checkbox" checked />
+              <span>Backend auto poll</span>
+            </label>
+            <div class="seed-actions">
+              <button class="ghost-button" type="button" id="presentationClearLiveButton">Clear live data</button>
+              <button class="primary-button" type="submit" id="presentationSeedSubmitButton">Test and import seed</button>
+            </div>
+          </form>
+          <p class="seed-result" id="presentationSeedResult">No live seed imported in this browser session.</p>
+        </section>
       </div>
     </div>
 
@@ -280,7 +387,7 @@
                   <span>Auto live poll every 30 seconds after seed import</span>
                 </label>
               </form>
-              <p class="seed-result" id="seedResult">Credentials are used for this request only and are not stored in the light app.</p>
+              <p class="seed-result" id="seedResult">Seed credentials are saved in the local backend state file for this light test build.</p>
             </section>
 
             <section class="panel">
@@ -317,6 +424,6 @@
       </main>
     </div>
 
-    <script src="/assets/app.js?v=single-code-layer-1" defer></script>
+    <script src="/assets/app.js?v=dashboard-actions-1" defer></script>
   </body>
 </html>

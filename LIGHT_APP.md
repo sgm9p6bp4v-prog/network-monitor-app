@@ -8,6 +8,10 @@ This is the first working lightweight version of NetWatch. It is intentionally s
 - Static frontend served by the backend.
 - Mock FS-like SNMP inventory.
 - Live seed discovery against a real SNMP switch.
+- Local JSON persistence for inventory, links, alerts, events, settings and layout.
+- Local JSON persistence for SNMP seed credentials in the light build.
+- Multi-seed runtime polling with credentials reloaded after backend restart.
+- Backend auto-poll scheduler with configurable interval.
 - Device list and device detail.
 - LLDP topology with confirmed and pending links.
 - Alert lifecycle: active, acknowledged, resolved.
@@ -21,9 +25,8 @@ This is the first working lightweight version of NetWatch. It is intentionally s
 - Credential encryption.
 - Docker secrets.
 - Alembic migrations.
-- Scheduled polling loops.
 
-The live seed mode uses SNMP for the immediate request, imports the result into memory, and does not store the community or SNMPv3 secrets.
+The light app persists runtime state in `data/netwatch_state.json`. That file is ignored by git. In this test build, SNMP communities and SNMPv3 secrets are also stored there in plaintext so live polling can resume after a backend restart. This is useful for LAN testing, but it is not the final security model: production still needs encrypted credential storage and key management.
 
 ## Run locally
 
@@ -61,6 +64,6 @@ The app reads:
 
 - `SNMPv2-MIB`: `sysName`, `sysDescr`, `sysObjectID`.
 - `IF-MIB` and `ifXTable`: interfaces, admin/oper state, counters.
-- `LLDP-MIB`: one-sided neighbor candidates.
+- `LLDP-MIB`: one-sided neighbor candidates plus local/remote port evidence when available.
 
-Credentials are only used for that request in this light build.
+Use the `SNMP Seed` button in the dashboard presentation UI for the same workflow without opening the old sidebar shell.

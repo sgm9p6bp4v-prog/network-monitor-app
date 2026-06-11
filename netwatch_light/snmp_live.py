@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid5, NAMESPACE_DNS
@@ -46,10 +47,38 @@ TABLE_OIDS = {
 }
 
 LLDP_OIDS = {
+    "remote_chassis_id_subtype": "1.0.8802.1.1.2.1.4.1.1.4",
     "remote_chassis_id": "1.0.8802.1.1.2.1.4.1.1.5",
+    "remote_port_id_subtype": "1.0.8802.1.1.2.1.4.1.1.6",
     "remote_port_id": "1.0.8802.1.1.2.1.4.1.1.7",
     "remote_port_desc": "1.0.8802.1.1.2.1.4.1.1.8",
     "remote_sys_name": "1.0.8802.1.1.2.1.4.1.1.9",
+    "remote_sys_desc": "1.0.8802.1.1.2.1.4.1.1.10",
+}
+
+LLDP_REMOTE_MGMT_OIDS = {
+    "remote_mgmt_if_subtype": "1.0.8802.1.1.2.1.4.2.1.3",
+}
+
+LLDP_LOCAL_OIDS = {
+    "local_port_id": "1.0.8802.1.1.2.1.3.7.1.3",
+    "local_port_desc": "1.0.8802.1.1.2.1.3.7.1.4",
+}
+
+BRIDGE_OIDS = {
+    "base_port_if_index": "1.3.6.1.2.1.17.1.4.1.2",
+    "fdb_port": "1.3.6.1.2.1.17.4.3.1.2",
+    "fdb_status": "1.3.6.1.2.1.17.4.3.1.3",
+}
+
+Q_BRIDGE_OIDS = {
+    "q_fdb_port": "1.3.6.1.2.1.17.7.1.2.2.1.2",
+    "q_fdb_status": "1.3.6.1.2.1.17.7.1.2.2.1.3",
+}
+
+ARP_OIDS = {
+    "ip_net_to_media_phys_address": "1.3.6.1.2.1.4.22.1.2",
+    "ip_net_to_media_net_address": "1.3.6.1.2.1.4.22.1.3",
 }
 
 ADMIN_STATUS = {1: "up", 2: "down", 3: "testing"}
@@ -62,6 +91,7 @@ OPER_STATUS = {
     6: "notPresent",
     7: "lowerLayerDown",
 }
+MAX_ENDPOINT_MACS_PER_PORT = 8
 
 
 @dataclass
@@ -101,6 +131,69 @@ def _text(value: Any) -> str:
     if hasattr(value, "prettyPrint"):
         return value.prettyPrint()
     return str(value)
+
+
+def _octets_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "asOctets"):
+        raw = bytes(value.asOctets())
+        if not raw:
+            return ""
+        return ":".join(f"{byte:02x}" for byte in raw)
+    return _text(value)
+
+
+def _normalize_mac(value: Any) -> str:
+    text = _octets_text(value) if hasattr(value, "asOctets") else str(value or "")
+    text = text.strip().lower().replace("-", ":").replace(".", "")
+    if ":" in text:
+        parts = [part.zfill(2) for part in text.split(":") if part]
+        if len(parts) == 6 and all(len(part) == 2 for part in parts):
+            return ":".join(parts)
+    compact = "".join(char for char in text if char in "0123456789abcdef")
+    if len(compact) == 12:
+        return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+    return ""
+
+
+def _mac_from_suffix(index: str) -> str:
+    parts = index.split(".")
+    if len(parts) < 6:
+        return ""
+    octets = [_int(part, -1) for part in parts[-6:]]
+    if any(octet < 0 or octet > 255 for octet in octets):
+        return ""
+    return ":".join(f"{octet:02x}" for octet in octets)
+
+
+def _is_usable_endpoint_mac(mac: str) -> bool:
+    normalized = _normalize_mac(mac)
+    if not normalized:
+        return False
+    octets = [int(part, 16) for part in normalized.split(":")]
+    return not (
+        all(octet == 0 for octet in octets)
+        or all(octet == 255 for octet in octets)
+        or bool(octets[0] & 1)
+    )
+
+
+def _lldp_id_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "asOctets"):
+        raw = bytes(value.asOctets())
+        if not raw:
+            return ""
+        try:
+            decoded = raw.decode("utf-8").strip("\x00").strip()
+        except UnicodeDecodeError:
+            decoded = ""
+        if decoded and all(32 <= ord(char) <= 126 for char in decoded):
+            return decoded
+        return ":".join(f"{byte:02x}" for byte in raw)
+    return _text(value)
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -166,7 +259,7 @@ async def _get_system(config: SnmpSeedConfig) -> dict[str, str]:
     return {key: _text(var_binds[index][1]) for index, key in enumerate(SYSTEM_OIDS)}
 
 
-async def _walk_table(config: SnmpSeedConfig, base_oid: str) -> dict[str, Any]:
+async def _walk_table(config: SnmpSeedConfig, base_oid: str, max_rows: int | None = None) -> dict[str, Any]:
     rows: dict[str, Any] = {}
     async for error_indication, error_status, error_index, var_binds in bulk_walk_cmd(
         SnmpEngine(),
@@ -187,6 +280,8 @@ async def _walk_table(config: SnmpSeedConfig, base_oid: str) -> dict[str, Any]:
             index = _suffix(oid, base_oid)
             if index is not None:
                 rows[index] = value
+                if max_rows is not None and len(rows) >= max_rows:
+                    return rows
     return rows
 
 
@@ -195,6 +290,24 @@ async def _walk_many(config: SnmpSeedConfig, tables: dict[str, str]) -> dict[str
     for name, oid in tables.items():
         results[name] = await _walk_table(config, oid)
     return results
+
+
+async def _walk_optional_table(config: SnmpSeedConfig, oid: str, max_rows: int = 768) -> dict[str, Any]:
+    try:
+        return await asyncio.wait_for(_walk_table(config, oid, max_rows=max_rows), timeout=8)
+    except (RuntimeError, TimeoutError):
+        return {}
+
+
+async def _walk_many_optional(config: SnmpSeedConfig, tables: dict[str, str]) -> dict[str, dict[str, Any]]:
+    async def walk_item(name: str, oid: str) -> tuple[str, dict[str, Any]]:
+        try:
+            return name, await _walk_optional_table(config, oid)
+        except RuntimeError:
+            return name, {}
+
+    pairs = await asyncio.gather(*(walk_item(name, oid) for name, oid in tables.items()))
+    return dict(pairs)
 
 
 def _status(table: dict[str, Any], index: str, mapping: dict[int, str]) -> str:
@@ -211,10 +324,136 @@ def _candidate_id(seed_device_id: str, index: str, name: str) -> str:
     return f"candidate-{uuid5(NAMESPACE_DNS, seed).hex[:12]}"
 
 
+def _endpoint_id(seed_device_id: str, mac: str) -> str:
+    return f"endpoint-{uuid5(NAMESPACE_DNS, f'{seed_device_id}|mac|{mac}').hex[:12]}"
+
+
+def _lldp_local_port_num(index: str) -> str:
+    parts = index.split(".")
+    if len(parts) >= 3:
+        return parts[1]
+    if len(parts) == 2:
+        return parts[1]
+    return index
+
+
+def _lldp_remote_index(mgmt_index: str) -> str:
+    parts = mgmt_index.split(".")
+    if len(parts) < 6:
+        return ""
+    return ".".join(parts[:3])
+
+
+def _lldp_mgmt_ip_from_index(mgmt_index: str) -> str:
+    parts = mgmt_index.split(".")
+    if len(parts) < 9:
+        return ""
+    subtype = parts[3]
+    length = _int(parts[4])
+    address = parts[5 : 5 + length]
+    if subtype != "1" or length != 4 or len(address) != 4:
+        return ""
+    octets = [_int(part, -1) for part in address]
+    if any(octet < 0 or octet > 255 for octet in octets) or all(octet == 0 for octet in octets):
+        return ""
+    return ".".join(str(octet) for octet in octets)
+
+
+def _lldp_management_addresses(rows: dict[str, Any]) -> dict[str, str]:
+    addresses: dict[str, str] = {}
+    for index in rows:
+        remote_index = _lldp_remote_index(index)
+        ip = _lldp_mgmt_ip_from_index(index)
+        if remote_index and ip:
+            addresses.setdefault(remote_index, ip)
+    return addresses
+
+
+def _arp_ip_by_mac(arp: dict[str, dict[str, Any]]) -> dict[str, str]:
+    addresses: dict[str, str] = {}
+    for index, raw_mac in arp["ip_net_to_media_phys_address"].items():
+        mac = _normalize_mac(raw_mac)
+        parts = index.split(".")
+        ip = ".".join(parts[-4:]) if len(parts) >= 5 else ""
+        if mac and ip and ip != "0.0.0.0":
+            addresses.setdefault(mac, ip)
+    return addresses
+
+
+def _fdb_rows(
+    bridge: dict[str, dict[str, Any]],
+    q_bridge: dict[str, dict[str, Any]],
+    bridge_port_to_if_index: dict[str, str],
+) -> list[dict[str, str]]:
+    rows_by_key: dict[tuple[str, str], dict[str, str]] = {}
+
+    for index, raw_port in bridge["fdb_port"].items():
+        mac = _mac_from_suffix(index)
+        bridge_port = str(_int(raw_port))
+        status = _int(bridge["fdb_status"].get(index), 3)
+        if status not in {3, 5} or not _is_usable_endpoint_mac(mac):
+            continue
+        if_index = bridge_port_to_if_index.get(bridge_port)
+        if not if_index:
+            continue
+        rows_by_key[(mac, if_index)] = {
+            "mac": mac,
+            "if_index": if_index,
+            "bridge_port": bridge_port,
+            "vlan": "",
+            "source_table": "BRIDGE-MIB",
+        }
+
+    for index, raw_port in q_bridge["q_fdb_port"].items():
+        mac = _mac_from_suffix(index)
+        bridge_port = str(_int(raw_port))
+        status = _int(q_bridge["q_fdb_status"].get(index), 3)
+        parts = index.split(".")
+        vlan = parts[0] if len(parts) >= 7 else ""
+        if status not in {3, 5} or not _is_usable_endpoint_mac(mac):
+            continue
+        if_index = bridge_port_to_if_index.get(bridge_port)
+        if not if_index:
+            continue
+        rows_by_key.setdefault(
+            (mac, if_index),
+            {
+                "mac": mac,
+                "if_index": if_index,
+                "bridge_port": bridge_port,
+                "vlan": vlan,
+                "source_table": "Q-BRIDGE-MIB",
+            },
+        )
+
+    return list(rows_by_key.values())
+
+
+def _vendor_from_mac(mac: str) -> str:
+    oui = _normalize_mac(mac).replace(":", "")[:6]
+    vendors = {
+        "649d99": "FS",
+        "c400ad": "unknown",
+        "f4f19e": "unknown",
+        "000ec6": "Siemens",
+        "001b1b": "Siemens",
+        "0021ba": "Siemens",
+        "28e9a4": "Siemens",
+    }
+    return vendors.get(oui, "unknown")
+
+
 async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
-    system = await _get_system(config)
-    tables = await _walk_many(config, TABLE_OIDS)
-    lldp = await _walk_many(config, LLDP_OIDS)
+    system, tables, lldp, local_lldp, remote_mgmt, bridge, q_bridge, arp = await asyncio.gather(
+        _get_system(config),
+        _walk_many(config, TABLE_OIDS),
+        _walk_many(config, LLDP_OIDS),
+        _walk_many(config, LLDP_LOCAL_OIDS),
+        _walk_many_optional(config, LLDP_REMOTE_MGMT_OIDS),
+        _walk_many_optional(config, BRIDGE_OIDS),
+        _walk_many_optional(config, Q_BRIDGE_OIDS),
+        _walk_many_optional(config, ARP_OIDS),
+    )
 
     sys_name = system.get("sys_name") or config.host
     sys_descr = system.get("sys_descr") or "SNMP device"
@@ -229,53 +468,91 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
         key=lambda item: [int(part) if part.isdigit() else part for part in item.split(".")],
     )
     interfaces = []
+    interface_by_index: dict[str, dict[str, Any]] = {}
     for index in indexes:
         name = _text(tables["if_name"].get(index)) or _text(tables["if_descr"].get(index)) or f"if{index}"
-        interfaces.append(
-            {
-                "id": f"{device_id}-if-{index}",
-                "name": name,
-                "if_index": index,
-                "if_alias": _text(tables["if_alias"].get(index)),
-                "if_descr": _text(tables["if_descr"].get(index)),
-                "if_phys_address": _text(tables["if_phys_address"].get(index)),
-                "if_high_speed": _int(tables["if_high_speed"].get(index)),
-                "admin_status": _status(tables["if_admin_status"], index, ADMIN_STATUS),
-                "oper_status": _status(tables["if_oper_status"], index, OPER_STATUS),
-                "in_bps": None,
-                "out_bps": None,
-                "in_octets": _int(tables["if_hc_in_octets"].get(index)),
-                "out_octets": _int(tables["if_hc_out_octets"].get(index)),
-                "in_errors": _int(tables["if_in_errors"].get(index)),
-                "out_errors": _int(tables["if_out_errors"].get(index)),
-                "in_discards": _int(tables["if_in_discards"].get(index)),
-                "out_discards": _int(tables["if_out_discards"].get(index)),
-                "alerting_enabled": True,
-            }
-        )
+        interface = {
+            "id": f"{device_id}-if-{index}",
+            "name": name,
+            "if_index": index,
+            "if_alias": _text(tables["if_alias"].get(index)),
+            "if_descr": _text(tables["if_descr"].get(index)),
+            "if_phys_address": _octets_text(tables["if_phys_address"].get(index)),
+            "if_high_speed": _int(tables["if_high_speed"].get(index)),
+            "admin_status": _status(tables["if_admin_status"], index, ADMIN_STATUS),
+            "oper_status": _status(tables["if_oper_status"], index, OPER_STATUS),
+            "in_bps": None,
+            "out_bps": None,
+            "in_octets": _int(tables["if_hc_in_octets"].get(index)),
+            "out_octets": _int(tables["if_hc_out_octets"].get(index)),
+            "in_errors": _int(tables["if_in_errors"].get(index)),
+            "out_errors": _int(tables["if_out_errors"].get(index)),
+            "in_discards": _int(tables["if_in_discards"].get(index)),
+            "out_discards": _int(tables["if_out_discards"].get(index)),
+            "alerting_enabled": True,
+        }
+        interfaces.append(interface)
+        interface_by_index[index] = interface
 
     candidates = []
-    for index, raw_name in sorted(lldp["remote_sys_name"].items()):
-        remote_name = _text(raw_name).strip()
-        if not remote_name:
-            continue
+    candidate_links = []
+    remote_mgmt_ips = _lldp_management_addresses(remote_mgmt["remote_mgmt_if_subtype"])
+    remote_indexes = sorted(
+        set(lldp["remote_chassis_id"])
+        | set(lldp["remote_port_id"])
+        | set(lldp["remote_port_desc"])
+        | set(lldp["remote_sys_name"])
+        | set(lldp["remote_sys_desc"]),
+        key=lambda item: [int(part) if part.isdigit() else part for part in item.split(".")],
+    )
+    for index in remote_indexes:
+        remote_chassis_id = _octets_text(lldp["remote_chassis_id"].get(index))
+        remote_sys_name = _text(lldp["remote_sys_name"].get(index)).strip()
+        remote_sys_desc = _text(lldp["remote_sys_desc"].get(index)).strip()
+        remote_mgmt_ip = remote_mgmt_ips.get(index, "")
+        remote_name = (
+            remote_sys_name
+            or (remote_sys_desc.splitlines()[0][:80] if remote_sys_desc else "")
+            or (f"LLDP neighbor {remote_chassis_id}" if remote_chassis_id else "")
+            or f"LLDP neighbor {index}"
+        )
         candidate_id = _candidate_id(device_id, index, remote_name)
+        local_port_num = _lldp_local_port_num(index)
+        local_interface = interface_by_index.get(local_port_num)
+        local_port_id = _lldp_id_text(local_lldp["local_port_id"].get(local_port_num))
+        local_port_desc = _text(local_lldp["local_port_desc"].get(local_port_num))
+        local_port_name = (
+            local_interface.get("name")
+            if local_interface
+            else local_port_id or local_port_desc or f"lldpLocalPort {local_port_num}"
+        )
+        remote_port_id = _lldp_id_text(lldp["remote_port_id"].get(index))
+        remote_port_desc = _text(lldp["remote_port_desc"].get(index))
+        remote_port_name = remote_port_id or remote_port_desc or "remote"
         candidates.append(
             {
                 "id": candidate_id,
                 "name": remote_name,
-                "ip": "unknown",
+                "ip": remote_mgmt_ip or "unknown",
                 "vendor": "unknown",
-                "model": "LLDP candidate",
+                "model": remote_sys_desc.splitlines()[0][:80] if remote_sys_desc else "LLDP candidate",
                 "status": "pending",
-                "fingerprint": _text(lldp["remote_chassis_id"].get(index)) or f"lldp-{index}",
+                "fingerprint": remote_chassis_id or f"lldp-{index}",
+                "chassis_id": remote_chassis_id,
+                "lldp_sys_name": remote_sys_name,
+                "lldp_sys_desc": remote_sys_desc,
+                "lldp_mgmt_ip": remote_mgmt_ip,
+                "lldp_index": index,
+                "lldp_local_port_num": local_port_num,
+                "lldp_local_port": local_port_name,
+                "lldp_remote_port": remote_port_name,
                 "alerting_enabled": False,
                 "layout": {"x": 780, "y": 160 + len(candidates) * 110, "locked": False, "source": "auto"},
                 "interfaces": [
                     {
                         "id": f"{candidate_id}-remote",
-                        "name": _text(lldp["remote_port_id"].get(index)) or _text(lldp["remote_port_desc"].get(index)) or "remote",
-                        "if_alias": _text(lldp["remote_port_desc"].get(index)),
+                        "name": remote_port_name,
+                        "if_alias": remote_port_desc,
                         "admin_status": "unknown",
                         "oper_status": "unknown",
                         "in_bps": None,
@@ -289,6 +566,191 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
                 ],
             }
         )
+        candidate_links.append(
+            {
+                "id": f"live-link-{device_id}-{candidate_id}-{local_port_num}",
+                "from": device_id,
+                "to": candidate_id,
+                "from_interface": local_interface["id"] if local_interface else None,
+                "to_interface": f"{candidate_id}-remote",
+                "local_port": local_port_name,
+                "remote_port": remote_port_name,
+                "status": "pending",
+                "evidence": "LLDP one side from seed",
+            }
+        )
+
+    lldp_local_if_indexes = {_lldp_local_port_num(index) for index in remote_indexes}
+    known_macs = {
+        _normalize_mac(interface.get("if_phys_address"))
+        for interface in interfaces
+        if interface.get("if_phys_address")
+    }
+    known_macs.update(_normalize_mac(candidate.get("chassis_id")) for candidate in candidates)
+    known_macs.discard("")
+    bridge_port_to_if_index = {
+        str(_int(port)): str(_int(raw_if_index))
+        for port, raw_if_index in bridge["base_port_if_index"].items()
+        if _int(port) > 0 and _int(raw_if_index) > 0
+    }
+    ip_by_mac = _arp_ip_by_mac(arp)
+    endpoint_rows = _fdb_rows(bridge, q_bridge, bridge_port_to_if_index)
+    endpoint_rows.sort(key=lambda row: [int(part) if part.isdigit() else part for part in row["if_index"].split(".")] + [row["mac"]])
+    fdb_macs_by_if_index: dict[str, set[str]] = {}
+    for row in endpoint_rows:
+        fdb_macs_by_if_index.setdefault(row["if_index"], set()).add(row["mac"])
+
+    endpoint_count = 0
+    seen_endpoint_macs: set[str] = set()
+    occupied_endpoint_if_indexes: set[str] = set()
+    suppressed_if_indexes = {
+        if_index for if_index, macs in fdb_macs_by_if_index.items() if len(macs) > MAX_ENDPOINT_MACS_PER_PORT
+    }
+    for row in endpoint_rows:
+        mac = row["mac"]
+        if_index = row["if_index"]
+        if (
+            mac in seen_endpoint_macs
+            or mac in known_macs
+            or if_index in lldp_local_if_indexes
+            or if_index in suppressed_if_indexes
+        ):
+            continue
+        local_interface = interface_by_index.get(if_index)
+        if not local_interface:
+            continue
+        endpoint_id = _endpoint_id(device_id, mac)
+        ip = ip_by_mac.get(mac, "")
+        vlan = row.get("vlan") or ""
+        local_port_name = local_interface.get("name") or f"if{if_index}"
+        local_port_alias = (local_interface.get("if_alias") or "").strip()
+        vendor = _vendor_from_mac(mac)
+        port_mac_count = len(fdb_macs_by_if_index.get(if_index, set()))
+        if local_port_alias:
+            name = local_port_alias if port_mac_count == 1 else f"{local_port_alias} {mac}"
+        else:
+            name = f"{vendor} endpoint {mac}" if vendor != "unknown" else f"Endpoint {mac}"
+        model_parts = ["MAC table endpoint"]
+        if vlan:
+            model_parts.append(f"VLAN/FDB {vlan}")
+        candidates.append(
+            {
+                "id": endpoint_id,
+                "name": name,
+                "ip": ip or "unknown",
+                "vendor": vendor,
+                "model": " / ".join(model_parts),
+                "status": "observed",
+                "device_type": "endpoint",
+                "fingerprint": mac,
+                "chassis_id": mac,
+                "mac": mac,
+                "observed_ip": ip,
+                "observed_vlan": vlan,
+                "observed_source": row["source_table"],
+                "observed_local_port": local_port_name,
+                "observed_local_port_alias": local_port_alias,
+                "alerting_enabled": False,
+                "layout": {"x": 940, "y": 180 + endpoint_count * 95, "locked": False, "source": "auto"},
+                "interfaces": [
+                    {
+                        "id": f"{endpoint_id}-mac",
+                        "name": mac,
+                        "if_alias": f"seen on {local_port_name}",
+                        "admin_status": "unknown",
+                        "oper_status": "observed",
+                        "in_bps": None,
+                        "out_bps": None,
+                        "in_errors": 0,
+                        "out_errors": 0,
+                        "in_discards": 0,
+                        "out_discards": 0,
+                        "alerting_enabled": False,
+                    }
+                ],
+            }
+        )
+        candidate_links.append(
+            {
+                "id": f"mac-link-{device_id}-{endpoint_id}-{if_index}",
+                "from": device_id,
+                "to": endpoint_id,
+                "from_interface": local_interface["id"],
+                "to_interface": f"{endpoint_id}-mac",
+                "local_port": local_port_name,
+                "remote_port": mac,
+                "status": "observed",
+                "evidence": f"MAC table {row['source_table']}",
+            }
+        )
+        seen_endpoint_macs.add(mac)
+        occupied_endpoint_if_indexes.add(if_index)
+        endpoint_count += 1
+
+    described_endpoint_count = 0
+    for if_index, local_interface in interface_by_index.items():
+        local_port_alias = (local_interface.get("if_alias") or "").strip()
+        if (
+            not local_port_alias
+            or if_index in lldp_local_if_indexes
+            or if_index in occupied_endpoint_if_indexes
+            or if_index in suppressed_if_indexes
+            or local_interface.get("oper_status") != "up"
+        ):
+            continue
+        local_port_name = local_interface.get("name") or f"if{if_index}"
+        endpoint_id = f"endpoint-{uuid5(NAMESPACE_DNS, f'{device_id}|portdesc|{if_index}|{local_port_alias}').hex[:12]}"
+        candidates.append(
+            {
+                "id": endpoint_id,
+                "name": local_port_alias,
+                "ip": "unknown",
+                "vendor": "unknown",
+                "model": "Port description endpoint",
+                "status": "observed",
+                "device_type": "endpoint",
+                "fingerprint": f"portdesc-{device_id}-{if_index}",
+                "chassis_id": "",
+                "mac": "",
+                "observed_ip": "",
+                "observed_vlan": "",
+                "observed_source": "PORT-DESCRIPTION",
+                "observed_local_port": local_port_name,
+                "observed_local_port_alias": local_port_alias,
+                "alerting_enabled": False,
+                "layout": {"x": 940, "y": 180 + (endpoint_count + described_endpoint_count) * 95, "locked": False, "source": "auto"},
+                "interfaces": [
+                    {
+                        "id": f"{endpoint_id}-port",
+                        "name": local_port_name,
+                        "if_alias": f"described endpoint on {local_port_name}",
+                        "admin_status": "unknown",
+                        "oper_status": "observed",
+                        "in_bps": None,
+                        "out_bps": None,
+                        "in_errors": 0,
+                        "out_errors": 0,
+                        "in_discards": 0,
+                        "out_discards": 0,
+                        "alerting_enabled": False,
+                    }
+                ],
+            }
+        )
+        candidate_links.append(
+            {
+                "id": f"portdesc-link-{device_id}-{endpoint_id}-{if_index}",
+                "from": device_id,
+                "to": endpoint_id,
+                "from_interface": local_interface["id"],
+                "to_interface": f"{endpoint_id}-port",
+                "local_port": local_port_name,
+                "remote_port": local_port_alias,
+                "status": "observed",
+                "evidence": "Port description",
+            }
+        )
+        described_endpoint_count += 1
 
     device = {
         "id": device_id,
@@ -302,27 +764,29 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
         "layout": {"x": 240, "y": 180, "locked": True, "source": "manual"},
         "interfaces": interfaces,
     }
-    links = [
-        {
-            "id": f"live-link-{device_id}-{candidate['id']}",
-            "from": device_id,
-            "to": candidate["id"],
-            "status": "pending",
-            "evidence": "LLDP one side from seed",
-        }
-        for candidate in candidates
-    ]
     return {
         "device": device,
         "candidates": candidates,
-        "links": links,
+        "links": candidate_links,
         "system": system,
         "counts": {
             "interfaces": len(interfaces),
-            "lldp_candidates": len(candidates),
+            "lldp_candidates": len(remote_indexes),
             "if_descr_rows": len(tables["if_descr"]),
             "if_name_rows": len(tables["if_name"]),
             "if_oper_status_rows": len(tables["if_oper_status"]),
             "lldp_remote_sys_name_rows": len(lldp["remote_sys_name"]),
+            "lldp_remote_rows": len(remote_indexes),
+            "lldp_remote_mgmt_rows": len(remote_mgmt["remote_mgmt_if_subtype"]),
+            "lldp_remote_mgmt_ips": len(remote_mgmt_ips),
+            "lldp_local_port_rows": len(local_lldp["local_port_id"]),
+            "bridge_fdb_rows": len(bridge["fdb_port"]),
+            "q_bridge_fdb_rows": len(q_bridge["q_fdb_port"]),
+            "arp_rows": len(arp["ip_net_to_media_phys_address"]),
+            "mac_endpoints": endpoint_count,
+            "described_endpoints": described_endpoint_count,
+            "mac_endpoint_ports_suppressed": sum(
+                1 for macs in fdb_macs_by_if_index.values() if len(macs) > MAX_ENDPOINT_MACS_PER_PORT
+            ),
         },
     }
