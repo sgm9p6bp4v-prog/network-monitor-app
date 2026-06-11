@@ -930,9 +930,15 @@ function bindAlertActionButtons(scope = document) {
       event.stopPropagation();
       const action = button.dataset.alertAction;
       const alertId = button.dataset.alertId;
-      const result = await apiPost(`/api/alerts/${alertId}/${action}`);
-      appState.snapshot = result.snapshot;
-      renderAll();
+      button.disabled = true;
+      try {
+        const result = await apiPost(`/api/alerts/${alertId}/${action}`);
+        appState.snapshot = result.snapshot;
+        renderAll();
+      } catch (error) {
+        button.disabled = false;
+        reportActionError(`Alert ${action}`, error);
+      }
     });
   });
 }
@@ -1076,13 +1082,9 @@ function renderDevicesTable() {
       `
     )
     .join("");
-
-  document.querySelectorAll("[data-device-id]").forEach((row) => {
-    row.addEventListener("click", () => {
-      appState.selectedDeviceId = row.dataset.deviceId;
-      renderDeviceDetail();
-    });
-  });
+  // Row clicks are handled by a single delegated listener bound once in
+  // bindEvents() on #devicesTable, so re-rendering the table does not
+  // re-attach a listener per row on every renderAll().
 }
 
 function renderDeviceDetail() {
@@ -1188,14 +1190,8 @@ function renderTopology() {
       `
     )
     .join("");
-
-  document.querySelectorAll("[data-node-device]").forEach((node) => {
-    node.addEventListener("click", () => {
-      appState.selectedDeviceId = node.dataset.nodeDevice;
-      switchView("devices");
-      renderDeviceDetail();
-    });
-  });
+  // Node clicks are handled by a single delegated listener bound once in
+  // bindEvents() on #nodeLayer (see device-selection delegation).
 }
 
 function topologyDeviceLabel(deviceMap, id) {
@@ -2472,7 +2468,10 @@ async function submitSeed(event) {
       resultEl.textContent = `Imported ${result.system.sys_name || payload.host}: ${result.counts.interfaces} interfaces, ${result.counts.lldp_candidates} LLDP candidates. Run poll again to calculate bps rates.`;
     }
     renderAll();
-    await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
+    await setBackendPolling(
+      document.getElementById("autoPollToggle").checked,
+      Number(getPollingSettings().backend_interval_seconds) || 30
+    );
     switchView("devices");
   } catch (error) {
     resultEl.className = "seed-result error";
@@ -2561,6 +2560,21 @@ function bindEvents() {
   document.querySelectorAll("[data-view-target]").forEach((item) => {
     item.addEventListener("click", () => switchView(item.dataset.viewTarget));
   });
+  // Delegated selection: bound once on the static containers, so re-rendering
+  // the devices table / topology nodes never re-attaches per-element listeners.
+  document.getElementById("devicesTable")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-device-id]");
+    if (!row) return;
+    appState.selectedDeviceId = row.dataset.deviceId;
+    renderDeviceDetail();
+  });
+  document.getElementById("nodeLayer")?.addEventListener("click", (event) => {
+    const node = event.target.closest("[data-node-device]");
+    if (!node) return;
+    appState.selectedDeviceId = node.dataset.nodeDevice;
+    switchView("devices");
+    renderDeviceDetail();
+  });
   document.getElementById("runPollButton").addEventListener("click", runPoll);
   document.getElementById("runDiscoveryButton").addEventListener("click", runDiscovery);
   document.getElementById("presentationRunPoll").addEventListener("click", runPoll);
@@ -2590,7 +2604,10 @@ function bindEvents() {
   document.getElementById("seedForm").addEventListener("submit", submitSeed);
   document.getElementById("seedVersion").addEventListener("change", syncSeedVersionFields);
   document.getElementById("autoPollToggle").addEventListener("change", async () => {
-    await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
+    await setBackendPolling(
+      document.getElementById("autoPollToggle").checked,
+      Number(getPollingSettings().backend_interval_seconds) || 30
+    );
   });
   window.addEventListener("resize", () => {
     renderTopology();

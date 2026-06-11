@@ -345,7 +345,8 @@ class NetWatchState:
 
         for link in endpoint_links:
             endpoint = devices_by_id.get(link["to"])
-            source = interfaces_by_id.get(link.get("from_interface"))
+            from_interface = link.get("from_interface")
+            source = interfaces_by_id.get(from_interface) if from_interface else None
             if not endpoint or not source:
                 continue
             switch, switch_interface = source
