@@ -2711,19 +2711,24 @@ function connectEvents() {
   });
 }
 
-letterizeLandingTitle();
-bindEvents();
-startDotTunnel();
-updatePresentationProgress();
-loadSnapshot().then(() => {
-  connectEvents();
-  const view = window.location.hash.replace("#", "");
-  if (viewMeta[view]) {
-    switchView(view, "auto");
-  } else {
-    enterPresentationMode("home", "auto");
-  }
-}).catch((error) => {
-  document.getElementById("backendState").textContent = "Backend unavailable";
-  document.getElementById("eventStreamState").textContent = error.message;
-});
+// Bootstrap. Guarded so the script can be loaded in a test harness (which sets
+// __NETWATCH_NO_BOOTSTRAP__) to exercise pure functions/renderers without wiring
+// the live UI, fetching, or opening sockets. Unset in the browser → runs normally.
+if (!globalThis.__NETWATCH_NO_BOOTSTRAP__) {
+  letterizeLandingTitle();
+  bindEvents();
+  startDotTunnel();
+  updatePresentationProgress();
+  loadSnapshot().then(() => {
+    connectEvents();
+    const view = window.location.hash.replace("#", "");
+    if (viewMeta[view]) {
+      switchView(view, "auto");
+    } else {
+      enterPresentationMode("home", "auto");
+    }
+  }).catch((error) => {
+    document.getElementById("backendState").textContent = "Backend unavailable";
+    document.getElementById("eventStreamState").textContent = error.message;
+  });
+}
