@@ -75,9 +75,17 @@ NETWATCH_SETUP_TOKEN=change-me .venv/bin/python -m uvicorn netwatch_light.main:a
 
 ## Tests
 
+Backend (pytest):
+
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
-.venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m pytest tests/ -q --ignore=tests/frontend
+```
+
+Frontend escaping regression test (plain Node, no extra deps):
+
+```bash
+node --test "tests/frontend/*.mjs"
 ```
 
 ## Live FS switch test
