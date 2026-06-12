@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .auth import require_setup_token
+from .auth import create_write_session, require_setup_token
 from .config import get_settings
 from .models import PollingRequest, SnmpSeedRequest, TopologyLayoutRequest
 from .snmp_live import SnmpSeedConfig, discover_seed
@@ -32,9 +32,14 @@ scheduler_task: asyncio.Task[None] | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_persisted_seed_configs()
-    if settings.SETUP_TOKEN == "":
+    runtime_settings = get_settings()
+    if runtime_settings.SETUP_TOKEN == "" and runtime_settings.LAN_TRUSTED:
         logger.warning(
-            "NETWATCH_SETUP_TOKEN is not set: mutating API endpoints are UNAUTHENTICATED (LAN-trusted mode)."
+            "NETWATCH_LAN_TRUSTED=1: mutating API endpoints are UNAUTHENTICATED."
+        )
+    elif runtime_settings.SETUP_TOKEN == "":
+        logger.error(
+            "Mutating API endpoints are disabled until NETWATCH_SETUP_TOKEN is set or NETWATCH_LAN_TRUSTED=1 is explicit."
         )
     if state.settings.get("polling", {}).get("backend_auto_poll"):
         start_scheduler()
@@ -209,6 +214,11 @@ async def snapshot(response: Response) -> dict[str, Any]:
         "scheduler_running": scheduler_task is not None and not scheduler_task.done(),
     }
     return data
+
+
+@app.post("/api/auth/session")
+async def auth_session(session: dict[str, Any] = Depends(create_write_session)) -> dict[str, Any]:
+    return session
 
 
 @app.post("/api/poll", dependencies=[Depends(require_setup_token)])

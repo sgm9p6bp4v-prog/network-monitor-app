@@ -12,8 +12,13 @@ DEFAULT_CORS_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
 @dataclass(frozen=True)
 class Settings:
     SETUP_TOKEN: str
+    LAN_TRUSTED: bool
     STATE_PATH: Path
     CORS_ORIGINS: list[str]
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @lru_cache
@@ -29,6 +34,7 @@ def get_settings() -> Settings:
     )
     return Settings(
         SETUP_TOKEN=os.environ.get("NETWATCH_SETUP_TOKEN", ""),
+        LAN_TRUSTED=_env_truthy("NETWATCH_LAN_TRUSTED"),
         STATE_PATH=Path(state_path_raw) if state_path_raw is not None else repo_root / "data" / "netwatch_state.json",
         CORS_ORIGINS=cors_origins,
     )

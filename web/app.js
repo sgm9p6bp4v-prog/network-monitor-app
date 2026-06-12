@@ -278,17 +278,35 @@ function formatSpeed(value) {
   return `${value} Mbps`;
 }
 
+const DEVICE_STATUSES = new Set(["up", "down", "warning", "pending", "observed", "unknown"]);
+const ALERT_STATES = new Set(["active", "acknowledged", "resolved"]);
+
+function safeEnum(value, allowed, fallback) {
+  const text = String(value ?? "").trim();
+  return allowed.has(text) ? text : fallback;
+}
+
+function deviceStatus(value) {
+  return safeEnum(value, DEVICE_STATUSES, "unknown");
+}
+
+function alertState(value) {
+  return safeEnum(value, ALERT_STATES, "active");
+}
+
 function statusLabel(status) {
-  if (status === "up") return "UP";
-  if (status === "down") return "DOWN";
-  if (status === "warning") return "WARNING";
-  if (status === "pending") return "PENDING";
-  if (status === "observed") return "OBSERVED";
+  const normalized = deviceStatus(status);
+  if (normalized === "up") return "UP";
+  if (normalized === "down") return "DOWN";
+  if (normalized === "warning") return "WARNING";
+  if (normalized === "pending") return "PENDING";
+  if (normalized === "observed") return "OBSERVED";
   return "UNKNOWN";
 }
 
 function stateLabel(value) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
+  const normalized = alertState(value);
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
 function getDevices() {
@@ -306,38 +324,62 @@ function getDeviceById(id) {
 function getAlertCounts() {
   return appState.snapshot.alerts.reduce(
     (acc, alert) => {
-      acc[alert.state] += 1;
+      acc[alertState(alert.state)] += 1;
       return acc;
     },
     { active: 0, acknowledged: 0, resolved: 0 }
   );
 }
 
-const SETUP_TOKEN_KEY = "netwatch_setup_token";
+const WRITE_CSRF_KEY = "netwatch_write_csrf";
 
-function getSetupToken() {
+function getWriteCsrfToken() {
   try {
-    return window.sessionStorage.getItem(SETUP_TOKEN_KEY) || "";
+    return window.sessionStorage.getItem(WRITE_CSRF_KEY) || "";
   } catch {
     return "";
   }
 }
 
-function setSetupToken(token) {
+function setWriteCsrfToken(token) {
   try {
     if (token) {
-      window.sessionStorage.setItem(SETUP_TOKEN_KEY, token);
+      window.sessionStorage.setItem(WRITE_CSRF_KEY, token);
     } else {
-      window.sessionStorage.removeItem(SETUP_TOKEN_KEY);
+      window.sessionStorage.removeItem(WRITE_CSRF_KEY);
     }
   } catch {
-    /* sessionStorage unavailable (private mode); token simply not persisted */
+    /* sessionStorage unavailable (private mode); write session simply is not persisted */
   }
 }
 
-function withSetupToken(headers = {}) {
-  const token = getSetupToken();
-  return token ? { ...headers, "X-Setup-Token": token } : headers;
+function withWriteSession(headers = {}) {
+  const csrf = getWriteCsrfToken();
+  return csrf ? { ...headers, "X-CSRF-Token": csrf } : headers;
+}
+
+async function createWriteSession(setupToken) {
+  if (!setupToken) {
+    setWriteCsrfToken("");
+    return { mode: "cleared" };
+  }
+  const response = await fetch("/api/auth/session", {
+    method: "POST",
+    headers: { "X-Setup-Token": setupToken }
+  });
+  if (!response.ok) {
+    let detail = `Session setup failed with ${response.status}`;
+    try {
+      const error = await response.json();
+      detail = error.detail || detail;
+    } catch {
+      detail = response.statusText || detail;
+    }
+    throw new Error(detail);
+  }
+  const result = await response.json();
+  setWriteCsrfToken(result.csrf_token || "");
+  return result;
 }
 
 async function apiGet(path) {
@@ -351,7 +393,7 @@ async function apiPost(path) {
 }
 
 async function apiPostJson(path, body) {
-  const headers = withSetupToken(body ? { "Content-Type": "application/json" } : {});
+  const headers = withWriteSession(body ? { "Content-Type": "application/json" } : {});
   const response = await fetch(path, {
     method: "POST",
     headers,
@@ -519,8 +561,9 @@ function renderDashboardAlertDetail() {
         ${alerts
           .map((alert) => {
             const device = getDeviceById(alert.device_id);
-            const canAck = alert.state === "active";
-            const canResolve = alert.state !== "resolved";
+            const state = alertState(alert.state);
+            const canAck = state === "active";
+            const canResolve = state !== "resolved";
             return `
               <article class="dashboard-alert-item">
                 <div>
@@ -528,7 +571,7 @@ function renderDashboardAlertDetail() {
                   <span>${escapeHtml(device ? device.name : "unknown device")}</span>
                   <p>${escapeHtml(alert.detail)}</p>
                 </div>
-                <span class="dashboard-alert-state ${escapeHtml(alert.state)}">${escapeHtml(stateLabel(alert.state))}</span>
+                <span class="dashboard-alert-state ${state}">${escapeHtml(stateLabel(state))}</span>
                 <div class="dashboard-alert-actions">
                   <button type="button" data-alert-action="ack" data-alert-id="${escapeHtml(alert.id)}" ${canAck ? "" : "disabled"}>Ack</button>
                   <button type="button" data-alert-action="resolve" data-alert-id="${escapeHtml(alert.id)}" ${canResolve ? "" : "disabled"}>Resolve</button>
@@ -572,7 +615,7 @@ function renderDashboardDeviceDetail() {
                   <span>${escapeHtml(device.ip || "unknown")} / ${escapeHtml(device.vendor || "unknown")}</span>
                   <p>${escapeHtml(device.model || "Unknown model")}</p>
                 </div>
-                <span class="dashboard-device-status ${escapeHtml(device.status || "unknown")}">${escapeHtml(statusLabel(device.status))}</span>
+                <span class="dashboard-device-status ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
               </article>
             `
           )
@@ -756,7 +799,7 @@ function renderPresentationDeviceInterfaces(device) {
             ${iface.traffic_source === "switch-port" ? `<span>${escapeHtml(iface.traffic_note || "estimated from switch port")}</span>` : ""}
             <span>${escapeHtml(String((iface.in_errors || 0) + (iface.out_errors || 0)))} errors / ${escapeHtml(String((iface.in_discards || 0) + (iface.out_discards || 0)))} discards</span>
           </div>
-          <span class="device-interface-state ${escapeHtml(iface.oper_status || "unknown")}">${escapeHtml(iface.admin_status || "n/a")} / ${escapeHtml(iface.oper_status || "n/a")}</span>
+          <span class="device-interface-state ${deviceStatus(iface.oper_status)}">${escapeHtml(iface.admin_status || "n/a")} / ${escapeHtml(iface.oper_status || "n/a")}</span>
         </li>
       `
     )
@@ -808,7 +851,7 @@ function renderPresentationDevices() {
         <article class="device-card" data-device-card data-device-index="${index}">
           <header class="device-card-head">
             <h3>${escapeHtml(device.name || "Unknown device")}</h3>
-            <span class="device-card-status ${escapeHtml(device.status || "unknown")}">${escapeHtml(statusLabel(device.status))}</span>
+            <span class="device-card-status ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
           </header>
           <div class="device-card-mark" aria-hidden="true">
             <span></span><span></span><span></span><span></span>
@@ -1039,7 +1082,7 @@ function renderDashboardDevices() {
           </div>
           <span>${escapeHtml(device.ip)}</span>
           <span>${escapeHtml(device.vendor)}</span>
-          <span class="status-pill ${escapeHtml(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
+          <span class="status-pill ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
         </article>
       `
     )
@@ -1077,7 +1120,7 @@ function renderDevicesTable() {
           <td><strong>${escapeHtml(device.name)}</strong><br><span class="muted">${escapeHtml(device.model)}</span></td>
           <td>${escapeHtml(device.ip)}</td>
           <td>${escapeHtml(device.vendor)}</td>
-          <td><span class="status-pill ${escapeHtml(device.status)}">${escapeHtml(statusLabel(device.status))}</span></td>
+          <td><span class="status-pill ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span></td>
         </tr>
       `
     )
@@ -1180,10 +1223,10 @@ function renderTopology() {
   nodes.innerHTML = [...normalized.values()]
     .map(
       (device) => `
-        <button class="topology-node ${escapeHtml(device.status)}" type="button" style="left:${device.x}px;top:${device.y}px" data-node-device="${escapeHtml(device.id)}">
+        <button class="topology-node ${deviceStatus(device.status)}" type="button" style="left:${device.x}px;top:${device.y}px" data-node-device="${escapeHtml(device.id)}">
           <span class="node-title">
             ${escapeHtml(device.name)}
-            <span class="status-pill ${escapeHtml(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
+            <span class="status-pill ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
           </span>
           <span class="node-meta">${escapeHtml(device.ip)}<br>${escapeHtml(device.model)}</span>
         </button>
@@ -2198,7 +2241,7 @@ function renderShowcaseTopology() {
       const saved = appState.topologyPositions[device.id];
       const pos = saved || layout.positions[device.id] || defaultShowcasePosition(device, index, devices.length, width, height, cardWidth, cardHeight);
       appState.topologyPositions[device.id] = pos;
-      const status = device.status || "unknown";
+      const status = deviceStatus(device.status);
       const model = device.model || "Unknown";
       const endpointTraffic = getEndpointTraffic(device);
       const source = device.device_type === "endpoint" ? device.mac || device.fingerprint : device.ip;
@@ -2209,11 +2252,11 @@ function renderShowcaseTopology() {
             endpointTraffic ? formatEndpointTraffic(device) : (device.vendor || model)
           ]
         : [source || "unknown", device.vendor || "Unknown", model];
-      const kindClass = isTopologyEndpoint(device) ? "is-endpoint" : device.status === "pending" ? "is-pending" : "is-seed";
+      const kindClass = isTopologyEndpoint(device) ? "is-endpoint" : status === "pending" ? "is-pending" : "is-seed";
       return `
-        <button class="showcase-node ${status} ${kindClass}" type="button" style="left:${pos.x}px;top:${pos.y}px" data-showcase-node="${device.id}">
+        <button class="showcase-node ${status} ${kindClass}" type="button" style="left:${pos.x}px;top:${pos.y}px" data-showcase-node="${escapeHtml(device.id)}">
           <span class="showcase-node-title">${escapeHtml(device.name || "Unknown")}</span>
-          <span class="showcase-status ${status}">${statusLabel(status)}</span>
+          <span class="showcase-status ${status}">${escapeHtml(statusLabel(status))}</span>
           <span class="showcase-meta">${metaLines.map((line) => escapeHtml(line)).join("<br>")}</span>
         </button>
       `;
@@ -2298,15 +2341,16 @@ function renderAlerts() {
   document.getElementById("alertList").innerHTML = appState.snapshot.alerts
     .map((alert) => {
       const device = getDeviceById(alert.device_id);
-      const canAck = alert.state === "active";
-      const canResolve = alert.state !== "resolved";
+      const state = alertState(alert.state);
+      const canAck = state === "active";
+      const canResolve = state !== "resolved";
       return `
         <article class="alert-item">
           <div>
             <strong>${escapeHtml(alert.title)}</strong>
             <p class="muted">${escapeHtml(device ? device.name : "unknown device")} - ${escapeHtml(alert.detail)}</p>
           </div>
-          <span class="status-pill ${escapeHtml(alert.state)}">${escapeHtml(stateLabel(alert.state))}</span>
+          <span class="status-pill ${state}">${escapeHtml(stateLabel(state))}</span>
           <div class="alert-actions">
             <button class="small-button" type="button" data-alert-action="ack" data-alert-id="${escapeHtml(alert.id)}" ${canAck ? "" : "disabled"}>Ack</button>
             <button class="small-button" type="button" data-alert-action="resolve" data-alert-id="${escapeHtml(alert.id)}" ${canResolve ? "" : "disabled"}>Resolve</button>
@@ -2629,14 +2673,22 @@ function bindEvents() {
   });
   const setupTokenInput = document.getElementById("setupTokenInput");
   if (setupTokenInput) {
-    setupTokenInput.value = getSetupToken();
-    document.getElementById("setupTokenSave")?.addEventListener("click", () => {
-      setSetupToken(setupTokenInput.value.trim());
+    setupTokenInput.value = "";
+    document.getElementById("setupTokenSave")?.addEventListener("click", async () => {
       const status = document.getElementById("setupTokenStatus");
-      if (status) {
-        status.textContent = getSetupToken()
-          ? "Setup token stored for this browser session."
-          : "Setup token cleared.";
+      if (status) status.textContent = "Creating write session...";
+      try {
+        const result = await createWriteSession(setupTokenInput.value.trim());
+        setupTokenInput.value = "";
+        if (status) {
+          status.textContent = result.mode === "cleared"
+            ? "Write session cleared."
+            : "Write session active for this browser session.";
+        }
+      } catch (error) {
+        setWriteCsrfToken("");
+        if (status) status.textContent = `Write session failed: ${error.message}`;
+        reportActionError("Write session", error);
       }
     });
   }

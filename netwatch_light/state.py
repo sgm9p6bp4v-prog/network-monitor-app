@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import stat
 import time
 from typing import Any
 from uuid import uuid4
@@ -30,6 +31,7 @@ class NetWatchState:
         self.persistence_path = persistence_path
         self.mode = "mock"
         self.live_failures = 0
+        self.live_failures_by_seed: dict[str, int] = {}
         self.live_counters: dict[str, dict[str, float | int]] = {}
         self.devices: list[dict[str, Any]] = default_devices()
         self.links: list[dict[str, Any]] = default_links()
@@ -46,6 +48,7 @@ class NetWatchState:
             "version": SNAPSHOT_VERSION,
             "mode": self.mode,
             "live_failures": self.live_failures,
+            "live_failures_by_seed": self.live_failures_by_seed,
             "devices": self.devices,
             "links": self.links,
             "alerts": self.alerts,
@@ -67,6 +70,13 @@ class NetWatchState:
             return
         self.mode = data.get("mode", self.mode)
         self.live_failures = int(data.get("live_failures", self.live_failures) or 0)
+        loaded_failures = data.get("live_failures_by_seed", {})
+        if isinstance(loaded_failures, dict):
+            self.live_failures_by_seed = {
+                str(key): int(value or 0) for key, value in loaded_failures.items()
+            }
+        elif self.live_failures:
+            self.live_failures_by_seed = {"__global__": self.live_failures}
         self.devices = data.get("devices", self.devices)
         self.links = data.get("links", self.links)
         self.alerts = data.get("alerts", self.alerts)
@@ -86,20 +96,40 @@ class NetWatchState:
                 "credential_storage": "local JSON state file, mode 0600 (credentials still plaintext)",
                 "master_key": "not configured",
                 "credential_dek": "not implemented; at-rest encryption still pending",
-                "write_session": "setup token via X-Setup-Token header (env NETWATCH_SETUP_TOKEN); unset = LAN-trusted",
+                "write_session": "1h HttpOnly write-session cookie + X-CSRF-Token; empty setup token disables writes unless NETWATCH_LAN_TRUSTED=1",
             }
         self.seeds = data.get("seeds", self.seeds)
         self.seed_credentials = data.get("seed_credentials", self.seed_credentials)
 
+    def _prepare_persistence_parent(self) -> None:
+        if self.persistence_path is None:
+            return
+        parent = self.persistence_path.parent
+        if parent.exists():
+            mode = stat.S_IMODE(parent.stat().st_mode)
+            if mode & 0o077:
+                raise PermissionError(
+                    f"State directory {parent} must not be accessible by group/others (mode {mode:04o})"
+                )
+            return
+        parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+
     def persist(self) -> None:
         if self.persistence_path is None:
             return
-        self.persistence_path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.persistence_path.parent, 0o700)
+        self._prepare_persistence_parent()
         tmp_path = self.persistence_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(self._payload(), indent=2), encoding="utf-8")
         os.chmod(tmp_path, 0o600)
         tmp_path.replace(self.persistence_path)
+
+    def _reset_live_failures(self, seed_key: str | None = None) -> None:
+        if seed_key:
+            self.live_failures_by_seed.pop(seed_key, None)
+        else:
+            self.live_failures_by_seed.clear()
+        self.live_failures = max(self.live_failures_by_seed.values(), default=0)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -172,6 +202,7 @@ class NetWatchState:
     def clear_live_inventory(self) -> dict[str, Any]:
         self.mode = "live"
         self.live_failures = 0
+        self.live_failures_by_seed = {}
         self.live_counters = {}
         self.devices = []
         self.links = []
@@ -235,7 +266,7 @@ class NetWatchState:
 
     def import_live_discovery(self, discovery: dict[str, Any], seed_key: str | None = None) -> dict[str, Any]:
         self.mode = "live"
-        self.live_failures = 0
+        self._reset_live_failures(seed_key)
         device = deepcopy(discovery["device"])
         if seed_key:
             device["seed_key"] = seed_key
@@ -277,8 +308,11 @@ class NetWatchState:
         return {"event": event, "snapshot": self.snapshot()}
 
     def mark_live_poll_failed(self, reason: str, seed_key: str | None = None) -> dict[str, Any]:
-        self.live_failures += 1
-        status = "down" if self.live_failures >= 3 else "unknown"
+        failure_key = seed_key or "__global__"
+        seed_failures = self.live_failures_by_seed.get(failure_key, 0) + 1
+        self.live_failures_by_seed[failure_key] = seed_failures
+        self.live_failures = max(self.live_failures_by_seed.values(), default=seed_failures)
+        status = "down" if seed_failures >= 3 else "unknown"
         for device in self.devices:
             if device.get("status") != "pending" and (seed_key is None or device.get("seed_key") == seed_key):
                 device["status"] = status
@@ -293,7 +327,7 @@ class NetWatchState:
                 seed["last_error"] = reason
         self._propagate_endpoint_port_traffic()
         self._sync_alerts_from_devices()
-        event = self.add_event(f"Live poll failed ({self.live_failures}/3): {reason}")
+        event = self.add_event(f"Live poll failed ({seed_failures}/3): {reason}")
         return {"event": event, "snapshot": self.snapshot()}
 
     def _calculate_live_rates(self, device: dict[str, Any]) -> None:

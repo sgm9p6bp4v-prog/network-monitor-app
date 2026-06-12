@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import netwatch_light.main as m
+from netwatch_light.config import get_settings
 from netwatch_light.state import NetWatchState
 
 
@@ -9,11 +10,14 @@ from netwatch_light.state import NetWatchState
 def client(monkeypatch, tmp_path):
     # main.app routes use the module-level state object; replace it so mutations
     # from TestClient lifespan shutdown and POST handlers persist only to tmp_path.
+    monkeypatch.setenv("NETWATCH_LAN_TRUSTED", "1")
+    get_settings.cache_clear()
     monkeypatch.setattr(m, "state", NetWatchState(tmp_path / "s.json"))
     m.seed_configs.clear()
     with TestClient(m.app) as test_client:
         yield test_client
     m.seed_configs.clear()
+    get_settings.cache_clear()
 
 
 def test_health(client):

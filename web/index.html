@@ -410,13 +410,13 @@
               <dl class="settings-list" id="securitySettings"></dl>
               <div class="setup-token-field">
                 <label>
-                  <span>Setup token (only if backend sets NETWATCH_SETUP_TOKEN)</span>
-                  <input id="setupTokenInput" type="password" autocomplete="off" placeholder="leave empty for LAN-trusted mode" />
+                  <span>Setup token (creates 1h write session)</span>
+                  <input id="setupTokenInput" type="password" autocomplete="off" placeholder="paste NETWATCH_SETUP_TOKEN" />
                 </label>
                 <div class="seed-actions">
                   <button class="ghost-button" type="button" id="setupTokenSave">Save token for this session</button>
                 </div>
-                <p class="seed-result" id="setupTokenStatus">Mutating API calls send this token via the X-Setup-Token header. Stored only in this browser session.</p>
+                <p class="seed-result" id="setupTokenStatus">The setup token is exchanged for an HttpOnly write-session cookie plus a CSRF token.</p>
               </div>
             </section>
 

@@ -1,5 +1,7 @@
 import stat
 
+import pytest
+
 from netwatch_light.state import NetWatchState
 
 
@@ -79,3 +81,34 @@ def test_persist_writes_secure_file_and_reloads_mode(tmp_path):
 
     reloaded = NetWatchState(state_path)
     assert reloaded.mode == "live"
+
+
+def test_persist_refuses_existing_group_accessible_state_directory(tmp_path):
+    state_dir = tmp_path / "shared"
+    state_dir.mkdir()
+    state_dir.chmod(0o755)
+    state = NetWatchState(state_dir / "state.json")
+
+    with pytest.raises(PermissionError):
+        state.persist()
+
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o755
+
+
+def test_seed_failures_are_tracked_per_seed(tmp_path):
+    state = NetWatchState(tmp_path / "state.json")
+    state.devices = [
+        {"id": "a-dev", "seed_key": "a", "status": "up", "interfaces": [], "alerting_enabled": True, "name": "A"},
+        {"id": "b-dev", "seed_key": "b", "status": "up", "interfaces": [], "alerting_enabled": True, "name": "B"},
+    ]
+    state.seeds = [{"key": "a", "status": "up", "last_error": ""}, {"key": "b", "status": "up", "last_error": ""}]
+
+    state.mark_live_poll_failed("boom", "a")
+    state.mark_live_poll_failed("boom", "a")
+    state._reset_live_failures("b")
+    state.mark_live_poll_failed("boom", "a")
+
+    assert state.live_failures_by_seed["a"] == 3
+    assert state.devices[0]["status"] == "down"
+    assert state.seeds[0]["status"] == "down"
+    assert state.devices[1]["status"] == "up"

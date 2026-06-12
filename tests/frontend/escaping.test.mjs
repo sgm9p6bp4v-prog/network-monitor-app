@@ -90,7 +90,8 @@ function makeDocument() {
       return makeEl();
     },
     body: makeEl(),
-    documentElement: makeEl()
+    documentElement: makeEl(),
+    _els: els
   };
 }
 
@@ -101,6 +102,8 @@ function loadApp() {
     document: makeDocument(),
     requestAnimationFrame: () => 0,
     cancelAnimationFrame() {},
+    addEventListener() {},
+    removeEventListener() {},
     matchMedia: () => ({ matches: false }),
     getComputedStyle: () => ({
       columnGap: "0",
@@ -108,7 +111,20 @@ function loadApp() {
       getPropertyValue() {
         return "";
       }
-    })
+    }),
+    CSS: {
+      escape(value) {
+        return String(value).replace(/[^a-zA-Z0-9_-]/g, "_");
+      }
+    },
+    innerWidth: 1200,
+    innerHeight: 800,
+    scrollY: 0,
+    performance: {
+      now() {
+        return 0;
+      }
+    }
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -122,7 +138,12 @@ function loadApp() {
     renderAlerts,
     renderDevicesTable,
     renderDeviceDetail,
-    renderKpis
+    renderKpis,
+    renderPresentationDashboard,
+    renderPresentationDevices,
+    renderTopology,
+    renderShowcaseTopology,
+    renderSettings
   };`;
   vm.runInContext(source + epilogue, sandbox);
   return sandbox;
@@ -186,6 +207,10 @@ function seedPoisonedSnapshot(sandbox) {
 function assertEscapedHtml(html) {
   assert.match(html, /&lt;img/);
   assert.doesNotMatch(html, /<img/i);
+}
+
+function allRenderedHtml(sandbox) {
+  return [...sandbox.document._els.values()].map((el) => el.innerHTML).join("\n");
 }
 
 test("escapeHtml escapes dangerous markup and tolerates nullish values", () => {
@@ -253,4 +278,31 @@ test("renderKpis escapes re-injected stream state in #kpiGrid", () => {
   sandbox.__nw.renderKpis();
 
   assertEscapedHtml(sandbox.document.getElementById("kpiGrid").innerHTML);
+});
+
+test("presentation and topology renderers escape device-controlled strings", () => {
+  const sandbox = loadApp();
+  seedPoisonedSnapshot(sandbox);
+
+  sandbox.__nw.renderPresentationDashboard();
+  sandbox.__nw.renderPresentationDevices();
+  sandbox.__nw.renderTopology();
+  sandbox.__nw.renderShowcaseTopology();
+  sandbox.__nw.renderSettings();
+
+  const html = allRenderedHtml(sandbox);
+  assert.match(html, /&lt;img/);
+  assert.doesNotMatch(html, new RegExp(PAYLOAD.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("showcase topology normalizes enum fields before writing class attributes", () => {
+  const sandbox = loadApp();
+  seedPoisonedSnapshot(sandbox);
+  sandbox.__nw.appState.snapshot.devices[0].status = 'up" autofocus onfocus="window.__xss=1';
+
+  sandbox.__nw.renderShowcaseTopology();
+
+  const html = sandbox.document.getElementById("showcaseNodeLayer").innerHTML;
+  assert.doesNotMatch(html, /autofocus onfocus/i);
+  assert.match(html, /showcase-node unknown/);
 });

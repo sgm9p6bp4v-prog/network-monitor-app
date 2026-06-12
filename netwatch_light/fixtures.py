@@ -338,6 +338,6 @@ def default_settings() -> dict:
             "credential_storage": "local JSON state file, mode 0600 (credentials still plaintext)",
             "master_key": "not configured",
             "credential_dek": "not implemented; at-rest encryption still pending",
-            "write_session": "setup token via X-Setup-Token header (env NETWATCH_SETUP_TOKEN); unset = LAN-trusted",
+            "write_session": "1h HttpOnly write-session cookie + X-CSRF-Token; empty setup token disables writes unless NETWATCH_LAN_TRUSTED=1",
         },
     }
