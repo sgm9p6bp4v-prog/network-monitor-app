@@ -3,10 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import stat
 import time
 from typing import Any
 from uuid import uuid4
+
+from .fixtures import default_alerts, default_devices, default_events, default_links, default_settings, metric_catalog
 
 SNAPSHOT_VERSION = 2
 EVENT_CAP = 20
@@ -27,320 +31,14 @@ class NetWatchState:
         self.persistence_path = persistence_path
         self.mode = "mock"
         self.live_failures = 0
+        self.live_failures_by_seed: dict[str, int] = {}
         self.live_counters: dict[str, dict[str, float | int]] = {}
-        self.devices: list[dict[str, Any]] = [
-            {
-                "id": "core-01",
-                "name": "fs-core-01",
-                "ip": "10.10.0.2",
-                "vendor": "FS",
-                "model": "S5860-20SQ",
-                "status": "up",
-                "fingerprint": "uuid+sysObjectID+chassis-8c:1f:64:10:00:01",
-                "alerting_enabled": True,
-                "layout": {"x": 520, "y": 70, "locked": True, "source": "manual"},
-                "interfaces": [
-                    {
-                        "id": "core-01-eth1-1",
-                        "name": "eth1/1",
-                        "if_alias": "uplink to agg-01",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 812_000_000,
-                        "out_bps": 690_000_000,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 1,
-                        "out_discards": 1,
-                        "alerting_enabled": True,
-                    },
-                    {
-                        "id": "core-01-eth1-2",
-                        "name": "eth1/2",
-                        "if_alias": "uplink to edge-02",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 226_000_000,
-                        "out_bps": 241_000_000,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 0,
-                        "out_discards": 0,
-                        "alerting_enabled": True,
-                    },
-                    {
-                        "id": "core-01-eth1-20",
-                        "name": "eth1/20",
-                        "if_alias": "reserved",
-                        "admin_status": "down",
-                        "oper_status": "down",
-                        "in_bps": 0,
-                        "out_bps": 0,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 0,
-                        "out_discards": 0,
-                        "alerting_enabled": False,
-                    },
-                ],
-            },
-            {
-                "id": "agg-01",
-                "name": "fs-agg-01",
-                "ip": "10.10.0.11",
-                "vendor": "FS",
-                "model": "S5850-48T4Q",
-                "status": "up",
-                "fingerprint": "uuid+sysObjectID+chassis-8c:1f:64:10:00:11",
-                "alerting_enabled": True,
-                "layout": {"x": 80, "y": 245, "locked": True, "source": "manual"},
-                "interfaces": [
-                    {
-                        "id": "agg-01-eth1-49",
-                        "name": "eth1/49",
-                        "if_alias": "core uplink",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 612_000_000,
-                        "out_bps": 590_000_000,
-                        "in_errors": 0,
-                        "out_errors": 1,
-                        "in_discards": 0,
-                        "out_discards": 1,
-                        "alerting_enabled": True,
-                    },
-                    {
-                        "id": "agg-01-eth1-4",
-                        "name": "eth1/4",
-                        "if_alias": "edge-01",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 92_000_000,
-                        "out_bps": 38_000_000,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 0,
-                        "out_discards": 0,
-                        "alerting_enabled": True,
-                    },
-                ],
-            },
-            {
-                "id": "edge-01",
-                "name": "fs-edge-01",
-                "ip": "10.10.1.21",
-                "vendor": "FS",
-                "model": "S3410-24TS-P",
-                "status": "warning",
-                "fingerprint": "uuid+sysObjectID+chassis-8c:1f:64:10:01:21",
-                "alerting_enabled": True,
-                "layout": {"x": 390, "y": 395, "locked": False, "source": "manual"},
-                "interfaces": [
-                    {
-                        "id": "edge-01-eth1-1",
-                        "name": "eth1/1",
-                        "if_alias": "agg uplink",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 120_000_000,
-                        "out_bps": 145_000_000,
-                        "in_errors": 1,
-                        "out_errors": 0,
-                        "in_discards": 2,
-                        "out_discards": 4,
-                        "alerting_enabled": True,
-                    },
-                    {
-                        "id": "edge-01-eth1-24",
-                        "name": "eth1/24",
-                        "if_alias": "access floor 2",
-                        "admin_status": "up",
-                        "oper_status": "down",
-                        "in_bps": 0,
-                        "out_bps": 0,
-                        "in_errors": 18,
-                        "out_errors": 0,
-                        "in_discards": 42,
-                        "out_discards": 9,
-                        "alerting_enabled": True,
-                    },
-                ],
-            },
-            {
-                "id": "edge-02",
-                "name": "fs-edge-02",
-                "ip": "10.10.2.22",
-                "vendor": "FS",
-                "model": "S3410-24TS-P",
-                "status": "up",
-                "fingerprint": "uuid+sysObjectID+chassis-8c:1f:64:10:02:22",
-                "alerting_enabled": True,
-                "layout": {"x": 820, "y": 245, "locked": False, "source": "manual"},
-                "interfaces": [
-                    {
-                        "id": "edge-02-eth1-1",
-                        "name": "eth1/1",
-                        "if_alias": "core uplink",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 140_000_000,
-                        "out_bps": 109_000_000,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 1,
-                        "out_discards": 0,
-                        "alerting_enabled": True,
-                    },
-                    {
-                        "id": "edge-02-eth1-13",
-                        "name": "eth1/13",
-                        "if_alias": "access lab",
-                        "admin_status": "up",
-                        "oper_status": "up",
-                        "in_bps": 18_000_000,
-                        "out_bps": 11_000_000,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 0,
-                        "out_discards": 0,
-                        "alerting_enabled": True,
-                    },
-                ],
-            },
-            {
-                "id": "pending-01",
-                "name": "fs-lab-pending",
-                "ip": "10.10.9.31",
-                "vendor": "FS",
-                "model": "LLDP candidate",
-                "status": "pending",
-                "fingerprint": "pending-lldp-one-sided",
-                "alerting_enabled": False,
-                "layout": {"x": 820, "y": 425, "locked": False, "source": "auto"},
-                "interfaces": [
-                    {
-                        "id": "pending-01-eth1-1",
-                        "name": "eth1/1",
-                        "if_alias": "candidate uplink",
-                        "admin_status": "unknown",
-                        "oper_status": "unknown",
-                        "in_bps": None,
-                        "out_bps": None,
-                        "in_errors": 0,
-                        "out_errors": 0,
-                        "in_discards": 0,
-                        "out_discards": 0,
-                        "alerting_enabled": False,
-                    }
-                ],
-            },
-        ]
-        self.links: list[dict[str, Any]] = [
-            {
-                "id": "link-core-agg",
-                "from": "core-01",
-                "to": "agg-01",
-                "status": "confirmed",
-                "evidence": "LLDP both sides",
-            },
-            {
-                "id": "link-core-edge-02",
-                "from": "core-01",
-                "to": "edge-02",
-                "status": "confirmed",
-                "evidence": "LLDP both sides",
-            },
-            {
-                "id": "link-agg-edge-01",
-                "from": "agg-01",
-                "to": "edge-01",
-                "status": "confirmed",
-                "evidence": "LLDP both sides",
-            },
-            {
-                "id": "link-edge-02-pending",
-                "from": "edge-02",
-                "to": "pending-01",
-                "status": "pending",
-                "evidence": "LLDP one side",
-            },
-        ]
-        self.alerts: list[dict[str, Any]] = [
-            {
-                "id": "alert-01",
-                "device_id": "edge-01",
-                "interface_id": "edge-01-eth1-24",
-                "title": "eth1/24 oper down",
-                "detail": "admin up + oper down for 3 polling cycles",
-                "severity": "critical",
-                "state": "active",
-                "created_at": now_iso(),
-            },
-            {
-                "id": "alert-02",
-                "device_id": "edge-01",
-                "interface_id": "edge-01-eth1-24",
-                "title": "eth1/24 discard rate",
-                "detail": "discard rate above global threshold",
-                "severity": "warning",
-                "state": "active",
-                "created_at": now_iso(),
-            },
-            {
-                "id": "alert-03",
-                "device_id": "agg-01",
-                "interface_id": "agg-01-eth1-49",
-                "title": "eth1/49 transient errors",
-                "detail": "acknowledged during maintenance window",
-                "severity": "warning",
-                "state": "acknowledged",
-                "created_at": now_iso(),
-            },
-        ]
-        self.events: list[dict[str, Any]] = [
-            {"id": str(uuid4()), "time": now_clock(), "text": "Light API started with FS-like SNMP fixtures"},
-            {"id": str(uuid4()), "time": now_clock(), "text": "LLDP topology loaded: 3 confirmed links, 1 pending link"},
-            {"id": str(uuid4()), "time": now_clock(), "text": "Static threshold alert active on edge-01 eth1/24"},
-        ]
-        self.metric_catalog = [
-            "interface.admin_status",
-            "interface.oper_status",
-            "interface.in_octets",
-            "interface.out_octets",
-            "interface.in_bps",
-            "interface.out_bps",
-            "interface.in_errors",
-            "interface.out_errors",
-            "interface.in_discards",
-            "interface.out_discards",
-            "interface.in_error_rate",
-            "interface.out_error_rate",
-            "interface.in_discard_rate",
-            "interface.out_discard_rate",
-        ]
-        self.settings = {
-            "polling": {
-                "status_seconds": 30,
-                "traffic_seconds": 60,
-                "inventory_minutes": 15,
-                "global_concurrency": 50,
-                "per_device_concurrency": 2,
-                "getbulk": "adaptive, starts at 25",
-                "backend_auto_poll": False,
-                "backend_interval_seconds": 30,
-                "backend_status": "stopped",
-            },
-            "thresholds": {
-                "interface_error_counter": 1,
-                "interface_discard_counter": 1,
-            },
-            "security": {
-                "credential_storage": "local JSON state file in light build",
-                "master_key": "not configured",
-                "credential_dek": "not implemented; plaintext local file",
-                "write_session": "not implemented",
-            },
-        }
+        self.devices: list[dict[str, Any]] = default_devices()
+        self.links: list[dict[str, Any]] = default_links()
+        self.alerts: list[dict[str, Any]] = default_alerts()
+        self.events: list[dict[str, Any]] = default_events()
+        self.metric_catalog = metric_catalog()
+        self.settings = default_settings()
         self.seeds: list[dict[str, Any]] = []
         self.seed_credentials: list[dict[str, Any]] = []
         self._load()
@@ -350,6 +48,7 @@ class NetWatchState:
             "version": SNAPSHOT_VERSION,
             "mode": self.mode,
             "live_failures": self.live_failures,
+            "live_failures_by_seed": self.live_failures_by_seed,
             "devices": self.devices,
             "links": self.links,
             "alerts": self.alerts,
@@ -371,6 +70,13 @@ class NetWatchState:
             return
         self.mode = data.get("mode", self.mode)
         self.live_failures = int(data.get("live_failures", self.live_failures) or 0)
+        loaded_failures = data.get("live_failures_by_seed", {})
+        if isinstance(loaded_failures, dict):
+            self.live_failures_by_seed = {
+                str(key): int(value or 0) for key, value in loaded_failures.items()
+            }
+        elif self.live_failures:
+            self.live_failures_by_seed = {"__global__": self.live_failures}
         self.devices = data.get("devices", self.devices)
         self.links = data.get("links", self.links)
         self.alerts = data.get("alerts", self.alerts)
@@ -387,21 +93,43 @@ class NetWatchState:
             self.settings["thresholds"].setdefault("interface_error_counter", 1)
             self.settings["thresholds"].setdefault("interface_discard_counter", 1)
             self.settings["security"] = {
-                "credential_storage": "local JSON state file in light build",
+                "credential_storage": "local JSON state file, mode 0600 (credentials still plaintext)",
                 "master_key": "not configured",
-                "credential_dek": "not implemented; plaintext local file",
-                "write_session": "not implemented",
+                "credential_dek": "not implemented; at-rest encryption still pending",
+                "write_session": "1h HttpOnly write-session cookie + X-CSRF-Token; empty setup token disables writes unless NETWATCH_LAN_TRUSTED=1",
             }
         self.seeds = data.get("seeds", self.seeds)
         self.seed_credentials = data.get("seed_credentials", self.seed_credentials)
 
+    def _prepare_persistence_parent(self) -> None:
+        if self.persistence_path is None:
+            return
+        parent = self.persistence_path.parent
+        if parent.exists():
+            mode = stat.S_IMODE(parent.stat().st_mode)
+            if mode & 0o077:
+                raise PermissionError(
+                    f"State directory {parent} must not be accessible by group/others (mode {mode:04o})"
+                )
+            return
+        parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+
     def persist(self) -> None:
         if self.persistence_path is None:
             return
-        self.persistence_path.parent.mkdir(parents=True, exist_ok=True)
+        self._prepare_persistence_parent()
         tmp_path = self.persistence_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(self._payload(), indent=2), encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
         tmp_path.replace(self.persistence_path)
+
+    def _reset_live_failures(self, seed_key: str | None = None) -> None:
+        if seed_key:
+            self.live_failures_by_seed.pop(seed_key, None)
+        else:
+            self.live_failures_by_seed.clear()
+        self.live_failures = max(self.live_failures_by_seed.values(), default=0)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -474,6 +202,7 @@ class NetWatchState:
     def clear_live_inventory(self) -> dict[str, Any]:
         self.mode = "live"
         self.live_failures = 0
+        self.live_failures_by_seed = {}
         self.live_counters = {}
         self.devices = []
         self.links = []
@@ -537,7 +266,7 @@ class NetWatchState:
 
     def import_live_discovery(self, discovery: dict[str, Any], seed_key: str | None = None) -> dict[str, Any]:
         self.mode = "live"
-        self.live_failures = 0
+        self._reset_live_failures(seed_key)
         device = deepcopy(discovery["device"])
         if seed_key:
             device["seed_key"] = seed_key
@@ -579,8 +308,11 @@ class NetWatchState:
         return {"event": event, "snapshot": self.snapshot()}
 
     def mark_live_poll_failed(self, reason: str, seed_key: str | None = None) -> dict[str, Any]:
-        self.live_failures += 1
-        status = "down" if self.live_failures >= 3 else "unknown"
+        failure_key = seed_key or "__global__"
+        seed_failures = self.live_failures_by_seed.get(failure_key, 0) + 1
+        self.live_failures_by_seed[failure_key] = seed_failures
+        self.live_failures = max(self.live_failures_by_seed.values(), default=seed_failures)
+        status = "down" if seed_failures >= 3 else "unknown"
         for device in self.devices:
             if device.get("status") != "pending" and (seed_key is None or device.get("seed_key") == seed_key):
                 device["status"] = status
@@ -595,7 +327,7 @@ class NetWatchState:
                 seed["last_error"] = reason
         self._propagate_endpoint_port_traffic()
         self._sync_alerts_from_devices()
-        event = self.add_event(f"Live poll failed ({self.live_failures}/3): {reason}")
+        event = self.add_event(f"Live poll failed ({seed_failures}/3): {reason}")
         return {"event": event, "snapshot": self.snapshot()}
 
     def _calculate_live_rates(self, device: dict[str, Any]) -> None:
@@ -647,7 +379,8 @@ class NetWatchState:
 
         for link in endpoint_links:
             endpoint = devices_by_id.get(link["to"])
-            source = interfaces_by_id.get(link.get("from_interface"))
+            from_interface = link.get("from_interface")
+            source = interfaces_by_id.get(from_interface) if from_interface else None
             if not endpoint or not source:
                 continue
             switch, switch_interface = source

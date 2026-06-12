@@ -1,7 +1,6 @@
 const appState = {
   selectedView: "home",
   selectedDeviceId: "core-01",
-  autoPollTimer: null,
   topologyPositions: {},
   topologyLayoutSignature: "",
   topologyLogicalSize: { width: 1, height: 1 },
@@ -279,17 +278,35 @@ function formatSpeed(value) {
   return `${value} Mbps`;
 }
 
+const DEVICE_STATUSES = new Set(["up", "down", "warning", "pending", "observed", "unknown"]);
+const ALERT_STATES = new Set(["active", "acknowledged", "resolved"]);
+
+function safeEnum(value, allowed, fallback) {
+  const text = String(value ?? "").trim();
+  return allowed.has(text) ? text : fallback;
+}
+
+function deviceStatus(value) {
+  return safeEnum(value, DEVICE_STATUSES, "unknown");
+}
+
+function alertState(value) {
+  return safeEnum(value, ALERT_STATES, "active");
+}
+
 function statusLabel(status) {
-  if (status === "up") return "UP";
-  if (status === "down") return "DOWN";
-  if (status === "warning") return "WARNING";
-  if (status === "pending") return "PENDING";
-  if (status === "observed") return "OBSERVED";
+  const normalized = deviceStatus(status);
+  if (normalized === "up") return "UP";
+  if (normalized === "down") return "DOWN";
+  if (normalized === "warning") return "WARNING";
+  if (normalized === "pending") return "PENDING";
+  if (normalized === "observed") return "OBSERVED";
   return "UNKNOWN";
 }
 
 function stateLabel(value) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
+  const normalized = alertState(value);
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
 function getDevices() {
@@ -307,11 +324,62 @@ function getDeviceById(id) {
 function getAlertCounts() {
   return appState.snapshot.alerts.reduce(
     (acc, alert) => {
-      acc[alert.state] += 1;
+      acc[alertState(alert.state)] += 1;
       return acc;
     },
     { active: 0, acknowledged: 0, resolved: 0 }
   );
+}
+
+const WRITE_CSRF_KEY = "netwatch_write_csrf";
+
+function getWriteCsrfToken() {
+  try {
+    return window.sessionStorage.getItem(WRITE_CSRF_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function setWriteCsrfToken(token) {
+  try {
+    if (token) {
+      window.sessionStorage.setItem(WRITE_CSRF_KEY, token);
+    } else {
+      window.sessionStorage.removeItem(WRITE_CSRF_KEY);
+    }
+  } catch {
+    /* sessionStorage unavailable (private mode); write session simply is not persisted */
+  }
+}
+
+function withWriteSession(headers = {}) {
+  const csrf = getWriteCsrfToken();
+  return csrf ? { ...headers, "X-CSRF-Token": csrf } : headers;
+}
+
+async function createWriteSession(setupToken) {
+  if (!setupToken) {
+    setWriteCsrfToken("");
+    return { mode: "cleared" };
+  }
+  const response = await fetch("/api/auth/session", {
+    method: "POST",
+    headers: { "X-Setup-Token": setupToken }
+  });
+  if (!response.ok) {
+    let detail = `Session setup failed with ${response.status}`;
+    try {
+      const error = await response.json();
+      detail = error.detail || detail;
+    } catch {
+      detail = response.statusText || detail;
+    }
+    throw new Error(detail);
+  }
+  const result = await response.json();
+  setWriteCsrfToken(result.csrf_token || "");
+  return result;
 }
 
 async function apiGet(path) {
@@ -325,9 +393,10 @@ async function apiPost(path) {
 }
 
 async function apiPostJson(path, body) {
+  const headers = withWriteSession(body ? { "Content-Type": "application/json" } : {});
   const response = await fetch(path, {
     method: "POST",
-    headers: body ? { "Content-Type": "application/json" } : {},
+    headers,
     body: body ? JSON.stringify(body) : undefined
   });
   if (!response.ok) {
@@ -421,6 +490,18 @@ function setLiveSetupOpen(open) {
   }
 }
 
+function setEventStreamState(text) {
+  const el = document.getElementById("eventStreamState");
+  if (el) el.textContent = text;
+}
+
+// User-visible failure feedback for action handlers, so a failed POST does not
+// silently dead-end on a button. Surfaced in the event-stream status line.
+function reportActionError(action, error) {
+  console.warn(`${action} failed`, error);
+  setEventStreamState(`${action} failed: ${error?.message || error}`);
+}
+
 async function loadSnapshot() {
   appState.snapshot = await apiGet("/api/snapshot");
   document.getElementById("backendState").textContent = "Connected";
@@ -446,10 +527,10 @@ function renderKpis() {
       (kpi) => `
         <article class="kpi-card">
           <div>
-            <span class="eyebrow">${kpi.label}</span>
-            <div class="kpi-value">${kpi.value}</div>
+            <span class="eyebrow">${escapeHtml(kpi.label)}</span>
+            <div class="kpi-value">${escapeHtml(kpi.value)}</div>
           </div>
-          <span class="kpi-trend">${kpi.trend}</span>
+          <span class="kpi-trend">${escapeHtml(kpi.trend)}</span>
         </article>
       `
     )
@@ -480,8 +561,9 @@ function renderDashboardAlertDetail() {
         ${alerts
           .map((alert) => {
             const device = getDeviceById(alert.device_id);
-            const canAck = alert.state === "active";
-            const canResolve = alert.state !== "resolved";
+            const state = alertState(alert.state);
+            const canAck = state === "active";
+            const canResolve = state !== "resolved";
             return `
               <article class="dashboard-alert-item">
                 <div>
@@ -489,7 +571,7 @@ function renderDashboardAlertDetail() {
                   <span>${escapeHtml(device ? device.name : "unknown device")}</span>
                   <p>${escapeHtml(alert.detail)}</p>
                 </div>
-                <span class="dashboard-alert-state ${escapeHtml(alert.state)}">${escapeHtml(stateLabel(alert.state))}</span>
+                <span class="dashboard-alert-state ${state}">${escapeHtml(stateLabel(state))}</span>
                 <div class="dashboard-alert-actions">
                   <button type="button" data-alert-action="ack" data-alert-id="${escapeHtml(alert.id)}" ${canAck ? "" : "disabled"}>Ack</button>
                   <button type="button" data-alert-action="resolve" data-alert-id="${escapeHtml(alert.id)}" ${canResolve ? "" : "disabled"}>Resolve</button>
@@ -533,7 +615,7 @@ function renderDashboardDeviceDetail() {
                   <span>${escapeHtml(device.ip || "unknown")} / ${escapeHtml(device.vendor || "unknown")}</span>
                   <p>${escapeHtml(device.model || "Unknown model")}</p>
                 </div>
-                <span class="dashboard-device-status ${escapeHtml(device.status || "unknown")}">${escapeHtml(statusLabel(device.status))}</span>
+                <span class="dashboard-device-status ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
               </article>
             `
           )
@@ -717,7 +799,7 @@ function renderPresentationDeviceInterfaces(device) {
             ${iface.traffic_source === "switch-port" ? `<span>${escapeHtml(iface.traffic_note || "estimated from switch port")}</span>` : ""}
             <span>${escapeHtml(String((iface.in_errors || 0) + (iface.out_errors || 0)))} errors / ${escapeHtml(String((iface.in_discards || 0) + (iface.out_discards || 0)))} discards</span>
           </div>
-          <span class="device-interface-state ${escapeHtml(iface.oper_status || "unknown")}">${escapeHtml(iface.admin_status || "n/a")} / ${escapeHtml(iface.oper_status || "n/a")}</span>
+          <span class="device-interface-state ${deviceStatus(iface.oper_status)}">${escapeHtml(iface.admin_status || "n/a")} / ${escapeHtml(iface.oper_status || "n/a")}</span>
         </li>
       `
     )
@@ -769,7 +851,7 @@ function renderPresentationDevices() {
         <article class="device-card" data-device-card data-device-index="${index}">
           <header class="device-card-head">
             <h3>${escapeHtml(device.name || "Unknown device")}</h3>
-            <span class="device-card-status ${escapeHtml(device.status || "unknown")}">${escapeHtml(statusLabel(device.status))}</span>
+            <span class="device-card-status ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
           </header>
           <div class="device-card-mark" aria-hidden="true">
             <span></span><span></span><span></span><span></span>
@@ -891,9 +973,15 @@ function bindAlertActionButtons(scope = document) {
       event.stopPropagation();
       const action = button.dataset.alertAction;
       const alertId = button.dataset.alertId;
-      const result = await apiPost(`/api/alerts/${alertId}/${action}`);
-      appState.snapshot = result.snapshot;
-      renderAll();
+      button.disabled = true;
+      try {
+        const result = await apiPost(`/api/alerts/${alertId}/${action}`);
+        appState.snapshot = result.snapshot;
+        renderAll();
+      } catch (error) {
+        button.disabled = false;
+        reportActionError(`Alert ${action}`, error);
+      }
     });
   });
 }
@@ -989,12 +1077,12 @@ function renderDashboardDevices() {
       (device) => `
         <article class="device-row">
           <div class="device-name">
-            <strong>${device.name}</strong>
-            <span>${device.model}</span>
+            <strong>${escapeHtml(device.name)}</strong>
+            <span>${escapeHtml(device.model)}</span>
           </div>
-          <span>${device.ip}</span>
-          <span>${device.vendor}</span>
-          <span class="status-pill ${device.status}">${statusLabel(device.status)}</span>
+          <span>${escapeHtml(device.ip)}</span>
+          <span>${escapeHtml(device.vendor)}</span>
+          <span class="status-pill ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
         </article>
       `
     )
@@ -1006,8 +1094,8 @@ function renderEvents() {
     .map(
       (event) => `
         <li>
-          <time>${event.time}</time>
-          ${event.text}
+          <time>${escapeHtml(event.time)}</time>
+          ${escapeHtml(event.text)}
         </li>
       `
     )
@@ -1028,22 +1116,18 @@ function renderDevicesTable() {
   document.getElementById("devicesTable").innerHTML = getDevices()
     .map(
       (device) => `
-        <tr class="clickable-row" data-device-id="${device.id}">
-          <td><strong>${device.name}</strong><br><span class="muted">${device.model}</span></td>
-          <td>${device.ip}</td>
-          <td>${device.vendor}</td>
-          <td><span class="status-pill ${device.status}">${statusLabel(device.status)}</span></td>
+        <tr class="clickable-row" data-device-id="${escapeHtml(device.id)}">
+          <td><strong>${escapeHtml(device.name)}</strong><br><span class="muted">${escapeHtml(device.model)}</span></td>
+          <td>${escapeHtml(device.ip)}</td>
+          <td>${escapeHtml(device.vendor)}</td>
+          <td><span class="status-pill ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span></td>
         </tr>
       `
     )
     .join("");
-
-  document.querySelectorAll("[data-device-id]").forEach((row) => {
-    row.addEventListener("click", () => {
-      appState.selectedDeviceId = row.dataset.deviceId;
-      renderDeviceDetail();
-    });
-  });
+  // Row clicks are handled by a single delegated listener bound once in
+  // bindEvents() on #devicesTable, so re-rendering the table does not
+  // re-attach a listener per row on every renderAll().
 }
 
 function renderDeviceDetail() {
@@ -1054,10 +1138,10 @@ function renderDeviceDetail() {
   document.getElementById("deviceDetailTitle").textContent = device.name;
   document.getElementById("deviceDetail").innerHTML = `
     <dl class="settings-list">
-      <div><dt>Management IP</dt><dd>${device.ip}</dd></div>
-      <div><dt>Vendor</dt><dd>${device.vendor}</dd></div>
-      <div><dt>Model</dt><dd>${device.model}</dd></div>
-      <div><dt>Fingerprint</dt><dd>${device.fingerprint}</dd></div>
+      <div><dt>Management IP</dt><dd>${escapeHtml(device.ip)}</dd></div>
+      <div><dt>Vendor</dt><dd>${escapeHtml(device.vendor)}</dd></div>
+      <div><dt>Model</dt><dd>${escapeHtml(device.model)}</dd></div>
+      <div><dt>Fingerprint</dt><dd>${escapeHtml(device.fingerprint)}</dd></div>
       ${endpointTraffic ? `<div><dt>Traffic source</dt><dd>${escapeHtml(endpointTraffic.switch_name || "switch")} / ${escapeHtml(endpointTraffic.switch_port || "port")} (${escapeHtml(endpointTraffic.note || "estimated")})</dd></div>` : ""}
     </dl>
     <div class="interface-list">
@@ -1066,11 +1150,11 @@ function renderDeviceDetail() {
           (iface) => `
             <article class="interface-item">
               <div>
-                <strong>${iface.name}</strong>
-                <span class="muted">${iface.if_alias || iface.if_descr || "no alias"}</span>
+                <strong>${escapeHtml(iface.name)}</strong>
+                <span class="muted">${escapeHtml(iface.if_alias || iface.if_descr || "no alias")}</span>
               </div>
-              <span class="status-pill ${iface.admin_status === "up" ? "up" : "neutral"}">admin ${iface.admin_status}</span>
-              <span class="status-pill ${iface.oper_status === "up" ? "up" : iface.oper_status === "down" ? "down" : "neutral"}">oper ${iface.oper_status}</span>
+              <span class="status-pill ${iface.admin_status === "up" ? "up" : "neutral"}">admin ${escapeHtml(iface.admin_status)}</span>
+              <span class="status-pill ${iface.oper_status === "up" ? "up" : iface.oper_status === "down" ? "down" : "neutral"}">oper ${escapeHtml(iface.oper_status)}</span>
               <span class="muted">${escapeHtml(formatInterfaceTraffic(iface, device)).replace(" / ", "<br>")}</span>
               <span class="muted">${iface.in_errors + iface.out_errors} errors<br>${iface.in_discards + iface.out_discards} discards</span>
               <span class="muted">${formatSpeed(iface.if_high_speed)}</span>
@@ -1139,24 +1223,18 @@ function renderTopology() {
   nodes.innerHTML = [...normalized.values()]
     .map(
       (device) => `
-        <button class="topology-node ${device.status}" type="button" style="left:${device.x}px;top:${device.y}px" data-node-device="${device.id}">
+        <button class="topology-node ${deviceStatus(device.status)}" type="button" style="left:${device.x}px;top:${device.y}px" data-node-device="${escapeHtml(device.id)}">
           <span class="node-title">
-            ${device.name}
-            <span class="status-pill ${device.status}">${statusLabel(device.status)}</span>
+            ${escapeHtml(device.name)}
+            <span class="status-pill ${deviceStatus(device.status)}">${escapeHtml(statusLabel(device.status))}</span>
           </span>
-          <span class="node-meta">${device.ip}<br>${device.model}</span>
+          <span class="node-meta">${escapeHtml(device.ip)}<br>${escapeHtml(device.model)}</span>
         </button>
       `
     )
     .join("");
-
-  document.querySelectorAll("[data-node-device]").forEach((node) => {
-    node.addEventListener("click", () => {
-      appState.selectedDeviceId = node.dataset.nodeDevice;
-      switchView("devices");
-      renderDeviceDetail();
-    });
-  });
+  // Node clicks are handled by a single delegated listener bound once in
+  // bindEvents() on #nodeLayer (see device-selection delegation).
 }
 
 function topologyDeviceLabel(deviceMap, id) {
@@ -2163,7 +2241,7 @@ function renderShowcaseTopology() {
       const saved = appState.topologyPositions[device.id];
       const pos = saved || layout.positions[device.id] || defaultShowcasePosition(device, index, devices.length, width, height, cardWidth, cardHeight);
       appState.topologyPositions[device.id] = pos;
-      const status = device.status || "unknown";
+      const status = deviceStatus(device.status);
       const model = device.model || "Unknown";
       const endpointTraffic = getEndpointTraffic(device);
       const source = device.device_type === "endpoint" ? device.mac || device.fingerprint : device.ip;
@@ -2174,11 +2252,11 @@ function renderShowcaseTopology() {
             endpointTraffic ? formatEndpointTraffic(device) : (device.vendor || model)
           ]
         : [source || "unknown", device.vendor || "Unknown", model];
-      const kindClass = isTopologyEndpoint(device) ? "is-endpoint" : device.status === "pending" ? "is-pending" : "is-seed";
+      const kindClass = isTopologyEndpoint(device) ? "is-endpoint" : status === "pending" ? "is-pending" : "is-seed";
       return `
-        <button class="showcase-node ${status} ${kindClass}" type="button" style="left:${pos.x}px;top:${pos.y}px" data-showcase-node="${device.id}">
+        <button class="showcase-node ${status} ${kindClass}" type="button" style="left:${pos.x}px;top:${pos.y}px" data-showcase-node="${escapeHtml(device.id)}">
           <span class="showcase-node-title">${escapeHtml(device.name || "Unknown")}</span>
-          <span class="showcase-status ${status}">${statusLabel(status)}</span>
+          <span class="showcase-status ${status}">${escapeHtml(statusLabel(status))}</span>
           <span class="showcase-meta">${metaLines.map((line) => escapeHtml(line)).join("<br>")}</span>
         </button>
       `;
@@ -2238,6 +2316,10 @@ function startDotTunnel() {
     }
 
     context.restore();
+    if (document.hidden) {
+      appState.tunnelAnimation = null;
+      return;
+    }
     appState.tunnelAnimation = window.requestAnimationFrame(draw);
   }
 
@@ -2259,18 +2341,19 @@ function renderAlerts() {
   document.getElementById("alertList").innerHTML = appState.snapshot.alerts
     .map((alert) => {
       const device = getDeviceById(alert.device_id);
-      const canAck = alert.state === "active";
-      const canResolve = alert.state !== "resolved";
+      const state = alertState(alert.state);
+      const canAck = state === "active";
+      const canResolve = state !== "resolved";
       return `
         <article class="alert-item">
           <div>
-            <strong>${alert.title}</strong>
-            <p class="muted">${device ? device.name : "unknown device"} - ${alert.detail}</p>
+            <strong>${escapeHtml(alert.title)}</strong>
+            <p class="muted">${escapeHtml(device ? device.name : "unknown device")} - ${escapeHtml(alert.detail)}</p>
           </div>
-          <span class="status-pill ${alert.state}">${stateLabel(alert.state)}</span>
+          <span class="status-pill ${state}">${escapeHtml(stateLabel(state))}</span>
           <div class="alert-actions">
-            <button class="small-button" type="button" data-alert-action="ack" data-alert-id="${alert.id}" ${canAck ? "" : "disabled"}>Ack</button>
-            <button class="small-button" type="button" data-alert-action="resolve" data-alert-id="${alert.id}" ${canResolve ? "" : "disabled"}>Resolve</button>
+            <button class="small-button" type="button" data-alert-action="ack" data-alert-id="${escapeHtml(alert.id)}" ${canAck ? "" : "disabled"}>Ack</button>
+            <button class="small-button" type="button" data-alert-action="resolve" data-alert-id="${escapeHtml(alert.id)}" ${canResolve ? "" : "disabled"}>Resolve</button>
           </div>
         </article>
       `;
@@ -2284,13 +2367,13 @@ function renderSettings() {
   const polling = appState.snapshot.settings.polling || {};
   const security = appState.snapshot.settings.security || {};
   document.getElementById("pollingSettings").innerHTML = Object.entries(polling)
-    .map(([key, value]) => `<div><dt>${key.replaceAll("_", " ")}</dt><dd>${value}</dd></div>`)
+    .map(([key, value]) => `<div><dt>${escapeHtml(key.replaceAll("_", " "))}</dt><dd>${escapeHtml(value)}</dd></div>`)
     .join("");
   document.getElementById("securitySettings").innerHTML = Object.entries(security)
-    .map(([key, value]) => `<div><dt>${key.replaceAll("_", " ")}</dt><dd>${value}</dd></div>`)
+    .map(([key, value]) => `<div><dt>${escapeHtml(key.replaceAll("_", " "))}</dt><dd>${escapeHtml(value)}</dd></div>`)
     .join("");
   document.getElementById("metricCatalog").innerHTML = appState.snapshot.metric_catalog
-    .map((metric) => `<span class="metric-chip">${metric}</span>`)
+    .map((metric) => `<span class="metric-chip">${escapeHtml(metric)}</span>`)
     .join("");
   document.getElementById("liveModeBadge").textContent = `${appState.snapshot.mode || "mock"} mode`;
   document.getElementById("liveModeBadge").className = `status-pill ${appState.snapshot.mode === "live" ? "up" : "neutral"}`;
@@ -2344,39 +2427,59 @@ function switchView(view, behavior = "smooth") {
 }
 
 async function runPoll() {
-  const result = await apiPost("/api/poll");
-  appState.snapshot = result.snapshot;
-  renderAll();
+  try {
+    const result = await apiPost("/api/poll");
+    appState.snapshot = result.snapshot;
+    renderAll();
+  } catch (error) {
+    reportActionError("Poll", error);
+  }
 }
 
 async function runDiscovery() {
-  const result = await apiPost("/api/discovery");
-  appState.snapshot = result.snapshot;
-  renderAll();
-  switchView("topology");
+  try {
+    const result = await apiPost("/api/discovery");
+    appState.snapshot = result.snapshot;
+    renderAll();
+    switchView("topology");
+  } catch (error) {
+    reportActionError("Discovery", error);
+  }
 }
 
 async function clearLiveInventory(resultId = "seedResult") {
-  stopAutoPoll();
-  const result = await apiPost("/api/live/clear");
-  appState.snapshot = result.snapshot;
-  appState.selectedDeviceId = "";
   const resultEl = document.getElementById(resultId);
-  if (resultEl) {
-    resultEl.className = "seed-result success";
-    resultEl.textContent = "Live data and saved seed credentials cleared. Add a seed switch to start discovery.";
+  try {
+    const result = await apiPost("/api/live/clear");
+    appState.snapshot = result.snapshot;
+    appState.selectedDeviceId = "";
+    if (resultEl) {
+      resultEl.className = "seed-result success";
+      resultEl.textContent = "Live data and saved seed credentials cleared. Add a seed switch to start discovery.";
+    }
+    renderAll();
+  } catch (error) {
+    if (resultEl) {
+      resultEl.className = "seed-result error";
+      resultEl.textContent = `Clear failed: ${error.message}`;
+    }
+    reportActionError("Clear", error);
   }
-  renderAll();
 }
 
 async function setBackendPolling(enabled, intervalSeconds = 30) {
-  const result = await apiPostJson("/api/polling", {
-    enabled,
-    interval_seconds: Number(intervalSeconds || 30)
-  });
-  appState.snapshot = result.snapshot;
-  renderAll();
-  return result;
+  try {
+    const result = await apiPostJson("/api/polling", {
+      enabled,
+      interval_seconds: Number(intervalSeconds || 30)
+    });
+    appState.snapshot = result.snapshot;
+    renderAll();
+    return result;
+  } catch (error) {
+    reportActionError("Polling update", error);
+    return null;
+  }
 }
 
 async function submitSeed(event) {
@@ -2409,7 +2512,10 @@ async function submitSeed(event) {
       resultEl.textContent = `Imported ${result.system.sys_name || payload.host}: ${result.counts.interfaces} interfaces, ${result.counts.lldp_candidates} LLDP candidates. Run poll again to calculate bps rates.`;
     }
     renderAll();
-    await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
+    await setBackendPolling(
+      document.getElementById("autoPollToggle").checked,
+      Number(getPollingSettings().backend_interval_seconds) || 30
+    );
     switchView("devices");
   } catch (error) {
     resultEl.className = "seed-result error";
@@ -2460,27 +2566,6 @@ async function submitPresentationSeed(event) {
   }
 }
 
-function startAutoPoll() {
-  stopAutoPoll();
-  const toggle = document.getElementById("autoPollToggle");
-  if (!toggle || !toggle.checked) return;
-  appState.autoPollTimer = window.setInterval(async () => {
-    if ((appState.snapshot.mode || "mock") !== "live") return;
-    try {
-      await runPoll();
-    } catch (error) {
-      document.getElementById("eventStreamState").textContent = `Poll failed: ${error.message}`;
-    }
-  }, 30000);
-}
-
-function stopAutoPoll() {
-  if (appState.autoPollTimer) {
-    window.clearInterval(appState.autoPollTimer);
-    appState.autoPollTimer = null;
-  }
-}
-
 function syncSeedVersionFields() {
   const version = document.getElementById("seedVersion")?.value || "2c";
   document.querySelectorAll(".v2-field").forEach((field) => {
@@ -2519,6 +2604,21 @@ function bindEvents() {
   document.querySelectorAll("[data-view-target]").forEach((item) => {
     item.addEventListener("click", () => switchView(item.dataset.viewTarget));
   });
+  // Delegated selection: bound once on the static containers, so re-rendering
+  // the devices table / topology nodes never re-attaches per-element listeners.
+  document.getElementById("devicesTable")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-device-id]");
+    if (!row) return;
+    appState.selectedDeviceId = row.dataset.deviceId;
+    renderDeviceDetail();
+  });
+  document.getElementById("nodeLayer")?.addEventListener("click", (event) => {
+    const node = event.target.closest("[data-node-device]");
+    if (!node) return;
+    appState.selectedDeviceId = node.dataset.nodeDevice;
+    switchView("devices");
+    renderDeviceDetail();
+  });
   document.getElementById("runPollButton").addEventListener("click", runPoll);
   document.getElementById("runDiscoveryButton").addEventListener("click", runDiscovery);
   document.getElementById("presentationRunPoll").addEventListener("click", runPoll);
@@ -2548,7 +2648,10 @@ function bindEvents() {
   document.getElementById("seedForm").addEventListener("submit", submitSeed);
   document.getElementById("seedVersion").addEventListener("change", syncSeedVersionFields);
   document.getElementById("autoPollToggle").addEventListener("change", async () => {
-    await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
+    await setBackendPolling(
+      document.getElementById("autoPollToggle").checked,
+      Number(getPollingSettings().backend_interval_seconds) || 30
+    );
   });
   window.addEventListener("resize", () => {
     renderTopology();
@@ -2565,39 +2668,119 @@ function bindEvents() {
     const view = window.location.hash.replace("#", "");
     switchView(viewMeta[view] ? view : "home");
   });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && !appState.tunnelAnimation) startDotTunnel();
+  });
+  const setupTokenInput = document.getElementById("setupTokenInput");
+  if (setupTokenInput) {
+    setupTokenInput.value = "";
+    document.getElementById("setupTokenSave")?.addEventListener("click", async () => {
+      const status = document.getElementById("setupTokenStatus");
+      if (status) status.textContent = "Creating write session...";
+      try {
+        const result = await createWriteSession(setupTokenInput.value.trim());
+        setupTokenInput.value = "";
+        if (status) {
+          status.textContent = result.mode === "cleared"
+            ? "Write session cleared."
+            : "Write session active for this browser session.";
+        }
+      } catch (error) {
+        setWriteCsrfToken("");
+        if (status) status.textContent = `Write session failed: ${error.message}`;
+        reportActionError("Write session", error);
+      }
+    });
+  }
+}
+
+const EVENT_RECONNECT_MIN_MS = 1000;
+const EVENT_RECONNECT_MAX_MS = 15000;
+let eventSocket = null;
+let eventReconnectTimer = null;
+let eventReconnectDelay = EVENT_RECONNECT_MIN_MS;
+let snapshotInflight = false;
+let snapshotQueued = false;
+
+// Coalesce snapshot refreshes: a single WS burst must not launch parallel
+// /api/snapshot fetches that could land out of order and clobber newer state.
+async function requestSnapshotRefresh() {
+  if (snapshotInflight) {
+    snapshotQueued = true;
+    return;
+  }
+  snapshotInflight = true;
+  try {
+    do {
+      snapshotQueued = false;
+      await loadSnapshot();
+    } while (snapshotQueued);
+  } catch (error) {
+    setEventStreamState(`Snapshot refresh failed: ${error.message}`);
+  } finally {
+    snapshotInflight = false;
+  }
+}
+
+function scheduleEventReconnect() {
+  if (eventReconnectTimer) return;
+  eventReconnectTimer = window.setTimeout(() => {
+    eventReconnectTimer = null;
+    connectEvents();
+  }, eventReconnectDelay);
+  eventReconnectDelay = Math.min(EVENT_RECONNECT_MAX_MS, eventReconnectDelay * 2);
 }
 
 function connectEvents() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/events`);
+  let socket;
+  try {
+    socket = new WebSocket(`${protocol}://${window.location.host}/ws/events`);
+  } catch (error) {
+    setEventStreamState(`WebSocket error: ${error.message}`);
+    scheduleEventReconnect();
+    return;
+  }
+  eventSocket = socket;
   socket.addEventListener("open", () => {
-    document.getElementById("eventStreamState").textContent = "WebSocket connected";
+    eventReconnectDelay = EVENT_RECONNECT_MIN_MS;
+    setEventStreamState("WebSocket connected");
     renderKpis();
     renderPresentationDashboard();
   });
-  socket.addEventListener("message", async () => {
-    await loadSnapshot();
+  socket.addEventListener("message", () => {
+    requestSnapshotRefresh();
+  });
+  socket.addEventListener("error", () => {
+    setEventStreamState("WebSocket error");
   });
   socket.addEventListener("close", () => {
-    document.getElementById("eventStreamState").textContent = "WebSocket closed";
+    if (eventSocket === socket) eventSocket = null;
+    setEventStreamState("WebSocket closed - reconnecting...");
     renderKpis();
     renderPresentationDashboard();
+    scheduleEventReconnect();
   });
 }
 
-letterizeLandingTitle();
-bindEvents();
-startDotTunnel();
-updatePresentationProgress();
-loadSnapshot().then(() => {
-  connectEvents();
-  const view = window.location.hash.replace("#", "");
-  if (viewMeta[view]) {
-    switchView(view, "auto");
-  } else {
-    enterPresentationMode("home", "auto");
-  }
-}).catch((error) => {
-  document.getElementById("backendState").textContent = "Backend unavailable";
-  document.getElementById("eventStreamState").textContent = error.message;
-});
+// Bootstrap. Guarded so the script can be loaded in a test harness (which sets
+// __NETWATCH_NO_BOOTSTRAP__) to exercise pure functions/renderers without wiring
+// the live UI, fetching, or opening sockets. Unset in the browser → runs normally.
+if (!globalThis.__NETWATCH_NO_BOOTSTRAP__) {
+  letterizeLandingTitle();
+  bindEvents();
+  startDotTunnel();
+  updatePresentationProgress();
+  loadSnapshot().then(() => {
+    connectEvents();
+    const view = window.location.hash.replace("#", "");
+    if (viewMeta[view]) {
+      switchView(view, "auto");
+    } else {
+      enterPresentationMode("home", "auto");
+    }
+  }).catch((error) => {
+    document.getElementById("backendState").textContent = "Backend unavailable";
+    document.getElementById("eventStreamState").textContent = error.message;
+  });
+}

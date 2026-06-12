@@ -1,61 +1,59 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
+import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
+from .auth import create_write_session, require_setup_token
+from .config import get_settings
+from .models import PollingRequest, SnmpSeedRequest, TopologyLayoutRequest
 from .snmp_live import SnmpSeedConfig, discover_seed
 from .state import NetWatchState
 
 
+logger = logging.getLogger("netwatch")
+settings = get_settings()
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT_DIR / "web"
-STATE_PATH = ROOT_DIR / "data" / "netwatch_state.json"
-
-app = FastAPI(title="NetWatch Light", version="0.1.0")
-state = NetWatchState(STATE_PATH)
+state = NetWatchState(settings.STATE_PATH)
 subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 seed_configs: dict[str, SnmpSeedConfig] = {}
 poll_lock = asyncio.Lock()
 scheduler_task: asyncio.Task[None] | None = None
 
 
-class SnmpSeedRequest(BaseModel):
-    host: str = Field(min_length=1, max_length=255)
-    port: int = Field(default=161, ge=1, le=65535)
-    version: str = Field(default="2c", pattern="^(2c|3)$")
-    community: str = ""
-    username: str = ""
-    auth_key: str = ""
-    priv_key: str = ""
-    auth_protocol: str = "SHA"
-    priv_protocol: str = "AES"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_persisted_seed_configs()
+    runtime_settings = get_settings()
+    if runtime_settings.SETUP_TOKEN == "" and runtime_settings.LAN_TRUSTED:
+        logger.warning(
+            "NETWATCH_LAN_TRUSTED=1: mutating API endpoints are UNAUTHENTICATED."
+        )
+    elif runtime_settings.SETUP_TOKEN == "":
+        logger.error(
+            "Mutating API endpoints are disabled until NETWATCH_SETUP_TOKEN is set or NETWATCH_LAN_TRUSTED=1 is explicit."
+        )
+    if state.settings.get("polling", {}).get("backend_auto_poll"):
+        start_scheduler()
+    try:
+        yield
+    finally:
+        await stop_scheduler()
 
 
-class PollingRequest(BaseModel):
-    enabled: bool
-    interval_seconds: int = Field(default=30, ge=5, le=3600)
-
-
-class TopologyLayoutPoint(BaseModel):
-    x: float
-    y: float
-    locked: bool = False
-
-
-class TopologyLayoutRequest(BaseModel):
-    layouts: dict[str, TopologyLayoutPoint]
+app = FastAPI(title="NetWatch Light", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -201,18 +199,6 @@ async def stop_scheduler() -> None:
     state.persist()
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    load_persisted_seed_configs()
-    if state.settings.get("polling", {}).get("backend_auto_poll"):
-        start_scheduler()
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await stop_scheduler()
-
-
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"status": "ok", "service": "netwatch-light"}
@@ -230,7 +216,12 @@ async def snapshot(response: Response) -> dict[str, Any]:
     return data
 
 
-@app.post("/api/poll")
+@app.post("/api/auth/session")
+async def auth_session(session: dict[str, Any] = Depends(create_write_session)) -> dict[str, Any]:
+    return session
+
+
+@app.post("/api/poll", dependencies=[Depends(require_setup_token)])
 async def run_poll() -> dict[str, Any]:
     if state.mode == "live":
         return await poll_live_seeds("manual poll")
@@ -239,7 +230,7 @@ async def run_poll() -> dict[str, Any]:
     return result
 
 
-@app.post("/api/discovery")
+@app.post("/api/discovery", dependencies=[Depends(require_setup_token)])
 async def run_discovery() -> dict[str, Any]:
     if state.mode == "live":
         return await poll_live_seeds("LLDP discovery")
@@ -248,7 +239,7 @@ async def run_discovery() -> dict[str, Any]:
     return result
 
 
-@app.post("/api/polling")
+@app.post("/api/polling", dependencies=[Depends(require_setup_token)])
 async def update_polling(payload: PollingRequest) -> dict[str, Any]:
     result = state.set_backend_polling(payload.enabled, payload.interval_seconds)
     if payload.enabled:
@@ -259,7 +250,7 @@ async def update_polling(payload: PollingRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/topology/layout")
+@app.post("/api/topology/layout", dependencies=[Depends(require_setup_token)])
 async def save_topology_layout(payload: TopologyLayoutRequest) -> dict[str, Any]:
     result = state.update_device_layouts(
         {device_id: point.model_dump() for device_id, point in payload.layouts.items()}
@@ -268,7 +259,7 @@ async def save_topology_layout(payload: TopologyLayoutRequest) -> dict[str, Any]
     return result
 
 
-@app.post("/api/live/clear")
+@app.post("/api/live/clear", dependencies=[Depends(require_setup_token)])
 async def clear_live_inventory() -> dict[str, Any]:
     seed_configs.clear()
     result = state.clear_live_inventory()
@@ -276,7 +267,7 @@ async def clear_live_inventory() -> dict[str, Any]:
     return result
 
 
-@app.post("/api/live/seed")
+@app.post("/api/live/seed", dependencies=[Depends(require_setup_token)])
 async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
     if seed.version == "2c" and not seed.community:
         raise HTTPException(status_code=400, detail="SNMPv2c community is required")
@@ -316,7 +307,7 @@ async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/api/alerts/{alert_id}/ack")
+@app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(require_setup_token)])
 async def acknowledge_alert(alert_id: str) -> dict[str, Any]:
     result = state.update_alert(alert_id, "ack")
     if result is None:
@@ -325,7 +316,7 @@ async def acknowledge_alert(alert_id: str) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/alerts/{alert_id}/resolve")
+@app.post("/api/alerts/{alert_id}/resolve", dependencies=[Depends(require_setup_token)])
 async def resolve_alert(alert_id: str) -> dict[str, Any]:
     result = state.update_alert(alert_id, "resolve")
     if result is None:
