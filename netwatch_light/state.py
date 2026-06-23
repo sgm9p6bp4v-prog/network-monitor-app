@@ -10,6 +10,8 @@ from uuid import uuid4
 
 SNAPSHOT_VERSION = 2
 EVENT_CAP = 20
+INTERFACE_HISTORY_SECONDS = 60 * 60
+INTERFACE_HISTORY_CAP = 720
 
 
 def now_iso() -> str:
@@ -28,6 +30,7 @@ class NetWatchState:
         self.mode = "mock"
         self.live_failures = 0
         self.live_counters: dict[str, dict[str, float | int]] = {}
+        self.interface_history: dict[str, list[dict[str, Any]]] = {}
         self.devices: list[dict[str, Any]] = [
             {
                 "id": "core-01",
@@ -343,6 +346,8 @@ class NetWatchState:
         }
         self.seeds: list[dict[str, Any]] = []
         self.seed_credentials: list[dict[str, Any]] = []
+        self.mac_labels: dict[str, dict[str, Any]] = {}
+        self.device_labels: dict[str, dict[str, Any]] = {}
         self._load()
 
     def _payload(self) -> dict[str, Any]:
@@ -358,6 +363,9 @@ class NetWatchState:
             "settings": self.settings,
             "seeds": self.seeds,
             "seed_credentials": self.seed_credentials,
+            "interface_history": self.interface_history,
+            "mac_labels": self.mac_labels,
+            "device_labels": self.device_labels,
         }
 
     def _load(self) -> None:
@@ -394,6 +402,25 @@ class NetWatchState:
             }
         self.seeds = data.get("seeds", self.seeds)
         self.seed_credentials = data.get("seed_credentials", self.seed_credentials)
+        loaded_history = data.get("interface_history", {})
+        if isinstance(loaded_history, dict):
+            self.interface_history = loaded_history
+        loaded_mac_labels = data.get("mac_labels", {})
+        if isinstance(loaded_mac_labels, dict):
+            self.mac_labels = {
+                key: label
+                for raw_key, label in loaded_mac_labels.items()
+                if (key := self._mac_label_key(raw_key)) and isinstance(label, dict)
+            }
+            self._apply_mac_labels()
+        loaded_device_labels = data.get("device_labels", {})
+        if isinstance(loaded_device_labels, dict):
+            self.device_labels = {
+                key: label
+                for raw_key, label in loaded_device_labels.items()
+                if (key := self._device_label_key(raw_key)) and isinstance(label, dict)
+            }
+            self._apply_device_labels()
 
     def persist(self) -> None:
         if self.persistence_path is None:
@@ -413,6 +440,52 @@ class NetWatchState:
             "metric_catalog": deepcopy(self.metric_catalog),
             "settings": deepcopy(self.settings),
             "seeds": deepcopy(self.seeds),
+            "mac_labels": deepcopy(self.mac_labels),
+            "device_labels": deepcopy(self.device_labels),
+        }
+
+    def get_device_history(self, device_id: str) -> dict[str, Any] | None:
+        device = self._device(device_id)
+        if device is None:
+            return None
+        cutoff = time.time() - INTERFACE_HISTORY_SECONDS
+        interfaces = []
+        for interface in device.get("interfaces", []):
+            history_key = self._interface_history_key(device["id"], interface["id"])
+            samples = [
+                sample
+                for sample in self.interface_history.get(history_key, [])
+                if float(sample.get("ts", 0) or 0) >= cutoff
+            ]
+            if not samples:
+                samples = [
+                    {
+                        "ts": time.time(),
+                        "in_bps": interface.get("in_bps"),
+                        "out_bps": interface.get("out_bps"),
+                    }
+                ]
+            interfaces.append(
+                {
+                    "id": interface.get("id"),
+                    "name": interface.get("name") or interface.get("if_descr") or "Interface",
+                    "if_alias": interface.get("if_alias") or interface.get("if_descr") or "",
+                    "if_high_speed": interface.get("if_high_speed"),
+                    "admin_status": interface.get("admin_status"),
+                    "oper_status": interface.get("oper_status"),
+                    "samples": deepcopy(samples),
+                }
+            )
+        return {
+            "device": {
+                "id": device["id"],
+                "name": device.get("name") or device["id"],
+                "ip": device.get("ip") or "unknown",
+                "vendor": device.get("vendor") or "unknown",
+                "model": device.get("model") or "unknown",
+            },
+            "window_seconds": INTERFACE_HISTORY_SECONDS,
+            "interfaces": interfaces,
         }
 
     def add_event(self, text: str) -> dict[str, Any]:
@@ -475,6 +548,7 @@ class NetWatchState:
         self.mode = "live"
         self.live_failures = 0
         self.live_counters = {}
+        self.interface_history = {}
         self.devices = []
         self.links = []
         self.alerts = []
@@ -483,6 +557,50 @@ class NetWatchState:
         self.events = []
         event = self.add_event("Live mode enabled: mock devices cleared, waiting for SNMP seed")
         return {"event": event, "snapshot": self.snapshot()}
+
+    def update_mac_label(self, mac: str, name: str, description: str = "") -> dict[str, Any]:
+        key = self._mac_label_key(mac)
+        if not key:
+            raise ValueError("A valid MAC address is required")
+        label_name = str(name or "").strip()
+        label_description = str(description or "").strip()
+        if not label_name and not label_description:
+            raise ValueError("Asset name or description is required")
+        self.mac_labels[key] = {
+            "mac": self._format_mac_key(key),
+            "name": label_name,
+            "description": label_description,
+            "updated_at": now_iso(),
+        }
+        updated = self._apply_mac_labels()
+        display = label_name or label_description
+        event = self.add_event(f"MAC label saved: {self._format_mac_key(key)} -> {display}")
+        return {"label": deepcopy(self.mac_labels[key]), "updated": updated, "event": event, "snapshot": self.snapshot()}
+
+    def update_device_label(self, device_id: str, name: str, description: str = "") -> dict[str, Any]:
+        key = self._device_label_key(device_id)
+        if not key:
+            raise ValueError("A valid device id is required")
+        device = self._device(key)
+        if device is None:
+            raise ValueError("Device not found")
+        if self._is_infrastructure_device(device):
+            raise ValueError("SNMP-managed switches keep their SNMP name")
+        label_name = str(name or "").strip()
+        label_description = str(description or "").strip()
+        if not label_name and not label_description:
+            raise ValueError("Asset name or description is required")
+        self.device_labels[key] = {
+            "device_id": key,
+            "name": label_name,
+            "description": label_description,
+            "updated_at": now_iso(),
+        }
+        updated = self._apply_device_labels()
+        self._apply_mac_labels()
+        display = label_name or label_description
+        event = self.add_event(f"Device label saved: {key} -> {display}")
+        return {"label": deepcopy(self.device_labels[key]), "updated": updated, "event": event, "snapshot": self.snapshot()}
 
     def set_backend_polling(self, enabled: bool, interval_seconds: int) -> dict[str, Any]:
         polling = self.settings.setdefault("polling", {})
@@ -543,6 +661,8 @@ class NetWatchState:
             device["seed_key"] = seed_key
         device["last_seen"] = now_iso()
         self._calculate_live_rates(device)
+        self._apply_device_label_to_device(device)
+        self._apply_mac_label_to_device(device)
         devices_by_id = {
             item["id"]: deepcopy(item)
             for item in self.devices
@@ -556,18 +676,35 @@ class NetWatchState:
             if pending.get("layout") and not pending.get("layout", {}).get("source") == "manual":
                 device["layout"] = pending["layout"]
         self._merge_device(devices_by_id, device)
+        skipped_candidate_ids: set[str] = set()
         for candidate in deepcopy(discovery["candidates"]):
             if seed_key:
                 candidate["seed_key"] = seed_key
             candidate["last_seen"] = now_iso()
+            self._apply_device_label_to_device(candidate)
+            self._apply_mac_label_to_device(candidate)
+            infrastructure_match_ids = self._segment_known_infrastructure_ids(candidate, devices_by_id)
+            if len(infrastructure_match_ids) == 1:
+                candidate_remap[candidate["id"]] = next(iter(infrastructure_match_ids))
+                continue
+            if len(infrastructure_match_ids) > 1:
+                skipped_candidate_ids.add(candidate["id"])
+                continue
             match_id = self._find_existing_device_id(candidate, devices_by_id)
             if match_id and match_id != candidate["id"] and devices_by_id[match_id].get("status") != "pending":
                 candidate_remap[candidate["id"]] = match_id
                 continue
             self._merge_device(devices_by_id, candidate)
         self.devices = list(devices_by_id.values())
-        self._merge_live_links(discovery["links"], candidate_remap, seed_key)
+        live_links = [
+            link
+            for link in discovery["links"]
+            if link.get("from") not in skipped_candidate_ids and link.get("to") not in skipped_candidate_ids
+        ]
+        self._merge_live_links(live_links, candidate_remap, seed_key)
+        self._prune_unlinked_observed_endpoints(seed_key)
         self._propagate_endpoint_port_traffic()
+        self._record_interface_history(self.devices)
         self._sync_alerts_from_devices()
         counts = discovery["counts"]
         event = self.add_event(
@@ -688,6 +825,48 @@ class NetWatchState:
             endpoint_interface["traffic_source"] = "switch-port"
             endpoint_interface["traffic_note"] = traffic_note
 
+    def _interface_history_key(self, device_id: str, interface_id: str) -> str:
+        return f"{device_id}::{interface_id}"
+
+    def _record_interface_history(self, devices: list[dict[str, Any]]) -> None:
+        now = time.time()
+        cutoff = now - INTERFACE_HISTORY_SECONDS
+        active_keys: set[str] = set()
+        for device in devices:
+            device_id = device.get("id")
+            if not device_id:
+                continue
+            for interface in device.get("interfaces", []):
+                interface_id = interface.get("id")
+                if not interface_id:
+                    continue
+                key = self._interface_history_key(device_id, interface_id)
+                active_keys.add(key)
+                samples = self.interface_history.setdefault(key, [])
+                samples.append(
+                    {
+                        "ts": now,
+                        "in_bps": interface.get("in_bps"),
+                        "out_bps": interface.get("out_bps"),
+                    }
+                )
+                self.interface_history[key] = [
+                    sample
+                    for sample in samples
+                    if float(sample.get("ts", 0) or 0) >= cutoff
+                ][-INTERFACE_HISTORY_CAP:]
+
+        for key in list(self.interface_history):
+            samples = [
+                sample
+                for sample in self.interface_history[key]
+                if float(sample.get("ts", 0) or 0) >= cutoff
+            ][-INTERFACE_HISTORY_CAP:]
+            if samples or key in active_keys:
+                self.interface_history[key] = samples
+            else:
+                self.interface_history.pop(key, None)
+
     def _merge_device(self, devices_by_id: dict[str, dict[str, Any]], device: dict[str, Any]) -> None:
         existing = devices_by_id.get(device["id"])
         if existing:
@@ -695,6 +874,65 @@ class NetWatchState:
                 device["layout"] = existing["layout"]
             device["alerting_enabled"] = existing.get("alerting_enabled", device.get("alerting_enabled", True))
         devices_by_id[device["id"]] = device
+
+    def _is_infrastructure_device(self, device: dict[str, Any]) -> bool:
+        if device.get("device_type") in {"endpoint", "segment"}:
+            return False
+        if device.get("lldp_sys_name") or device.get("lldp_mgmt_ip"):
+            return True
+        if device.get("seed_key") or str(device.get("id", "")).startswith("live-"):
+            return True
+        return bool(device.get("interfaces"))
+
+    def _infrastructure_mac_index(self, devices_by_id: dict[str, dict[str, Any]]) -> dict[str, str]:
+        index: dict[str, str] = {}
+        for device in devices_by_id.values():
+            if not self._is_infrastructure_device(device):
+                continue
+            for value in (device.get("mac"), device.get("observed_mac"), device.get("fingerprint"), device.get("chassis_id")):
+                key = self._mac_label_key(value)
+                if key:
+                    index.setdefault(key, device["id"])
+            for interface in device.get("interfaces", []):
+                key = self._mac_label_key(interface.get("if_phys_address"))
+                if key:
+                    index.setdefault(key, device["id"])
+        return index
+
+    def _segment_known_infrastructure_ids(
+        self, candidate: dict[str, Any], devices_by_id: dict[str, dict[str, Any]]
+    ) -> set[str]:
+        if candidate.get("device_type") != "segment":
+            return set()
+        observed_keys = {
+            key
+            for mac in candidate.get("observed_macs", [])
+            if (key := self._mac_label_key(mac))
+        }
+        if not observed_keys:
+            return set()
+        mac_index = self._infrastructure_mac_index(devices_by_id)
+        matches: set[str] = set()
+        for key in sorted(observed_keys):
+            match_id = mac_index.get(key)
+            if match_id:
+                matches.add(match_id)
+        return matches
+
+    def _prune_unlinked_observed_endpoints(self, seed_key: str | None) -> None:
+        if not seed_key:
+            return
+        linked_ids = {link.get("from") for link in self.links} | {link.get("to") for link in self.links}
+        self.devices = [
+            device
+            for device in self.devices
+            if not (
+                device.get("seed_key") == seed_key
+                and device.get("device_type") in {"endpoint", "segment"}
+                and device.get("status") == "observed"
+                and device.get("id") not in linked_ids
+            )
+        ]
 
     def _should_replace_auto_discovery_item(self, item: dict[str, Any], seed_key: str | None) -> bool:
         if not seed_key or item.get("seed_key") != seed_key:
@@ -789,6 +1027,98 @@ class NetWatchState:
         if not text:
             return ""
         return "".join(char for char in text if char.isalnum())
+
+    def _mac_label_key(self, value: Any) -> str:
+        normalized = self._normalize_identifier(value)
+        if len(normalized) == 12 and all(char in "0123456789abcdef" for char in normalized):
+            return normalized
+        return ""
+
+    def _format_mac_key(self, key: str) -> str:
+        return ":".join(key[index : index + 2] for index in range(0, 12, 2))
+
+    def _device_label_key(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text or len(text) > 200:
+            return ""
+        return text
+
+    def _apply_device_label_to_device(self, device: dict[str, Any]) -> bool:
+        if self._is_infrastructure_device(device):
+            return False
+        key = self._device_label_key(device.get("id"))
+        label = self.device_labels.get(key)
+        if not label:
+            return False
+        name = str(label.get("name") or "").strip()
+        description = str(label.get("description") or "").strip()
+        if name:
+            device["name"] = name
+            device["name_source"] = "device-label"
+        if description:
+            device["description"] = description
+        device["device_label"] = deepcopy(label)
+        return True
+
+    def _apply_device_labels(self) -> int:
+        updated = 0
+        for device in self.devices:
+            if self._apply_device_label_to_device(device):
+                updated += 1
+        return updated
+
+    def _device_mac_label_keys(self, device: dict[str, Any]) -> list[str]:
+        keys: list[str] = []
+
+        def add(value: Any) -> None:
+            key = self._mac_label_key(value)
+            if key and key not in keys:
+                keys.append(key)
+
+        for value in (
+            device.get("asset_mac"),
+            device.get("mac"),
+            device.get("observed_mac"),
+            device.get("chassis_id"),
+            device.get("fingerprint"),
+        ):
+            add(value)
+        for value in device.get("observed_macs", []) or []:
+            add(value)
+        return keys
+
+    def _device_mac_label_key(self, device: dict[str, Any]) -> str:
+        keys = self._device_mac_label_keys(device)
+        return keys[0] if keys else ""
+
+    def _apply_mac_label_to_device(self, device: dict[str, Any]) -> bool:
+        key = ""
+        label = None
+        for candidate_key in self._device_mac_label_keys(device):
+            candidate_label = self.mac_labels.get(candidate_key)
+            if candidate_label:
+                key = candidate_key
+                label = candidate_label
+                break
+        if not label:
+            return False
+        name = str(label.get("name") or "").strip()
+        description = str(label.get("description") or "").strip()
+        if name:
+            device["name"] = name
+            device["name_source"] = "mac-label"
+        if description:
+            device["description"] = description
+        device["asset_mac"] = self._format_mac_key(key)
+        device["asset_label"] = deepcopy(label)
+        return True
+
+    def _apply_mac_labels(self) -> int:
+        updated = 0
+        for device in self.devices:
+            if self._apply_mac_label_to_device(device):
+                updated += 1
+        return updated
 
     def _merge_live_links(
         self, links: list[dict[str, Any]], candidate_remap: dict[str, str], seed_key: str | None

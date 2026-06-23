@@ -74,6 +74,10 @@ BRIDGE_OIDS = {
 Q_BRIDGE_OIDS = {
     "q_fdb_port": "1.3.6.1.2.1.17.7.1.2.2.1.2",
     "q_fdb_status": "1.3.6.1.2.1.17.7.1.2.2.1.3",
+    "q_pvid": "1.3.6.1.2.1.17.7.1.4.5.1.1",
+    "q_vlan_static_name": "1.3.6.1.2.1.17.7.1.4.3.1.1",
+    "q_vlan_static_egress_ports": "1.3.6.1.2.1.17.7.1.4.3.1.2",
+    "q_vlan_static_untagged_ports": "1.3.6.1.2.1.17.7.1.4.3.1.4",
 }
 
 ARP_OIDS = {
@@ -92,6 +96,7 @@ OPER_STATUS = {
     7: "lowerLayerDown",
 }
 MAX_ENDPOINT_MACS_PER_PORT = 8
+MULTI_MAC_SEGMENT_THRESHOLD = 1
 
 
 @dataclass
@@ -328,6 +333,10 @@ def _endpoint_id(seed_device_id: str, mac: str) -> str:
     return f"endpoint-{uuid5(NAMESPACE_DNS, f'{seed_device_id}|mac|{mac}').hex[:12]}"
 
 
+def _shared_segment_id(seed_device_id: str, if_index: str) -> str:
+    return f"segment-{uuid5(NAMESPACE_DNS, f'{seed_device_id}|shared-mac-port|{if_index}').hex[:12]}"
+
+
 def _lldp_local_port_num(index: str) -> str:
     parts = index.split(".")
     if len(parts) >= 3:
@@ -429,6 +438,105 @@ def _fdb_rows(
     return list(rows_by_key.values())
 
 
+def _portlist_bridge_ports(value: Any) -> list[str]:
+    if value is None or not hasattr(value, "asOctets"):
+        return []
+    ports: list[str] = []
+    for byte_index, byte in enumerate(bytes(value.asOctets())):
+        for bit_index in range(8):
+            if byte & (1 << (7 - bit_index)):
+                ports.append(str(byte_index * 8 + bit_index + 1))
+    return ports
+
+
+def _sorted_vlan_ids(values: set[str]) -> list[str]:
+    return sorted(values, key=lambda value: _int(value, 4096))
+
+
+def _vlan_config_by_if_index(
+    q_bridge: dict[str, dict[str, Any]],
+    bridge_port_to_if_index: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    vlan_names = {
+        str(_int(vlan_id)): _text(raw_name)
+        for vlan_id, raw_name in q_bridge["q_vlan_static_name"].items()
+        if _int(vlan_id) > 0
+    }
+    port_data: dict[str, dict[str, Any]] = {}
+
+    def data_for(if_index: str) -> dict[str, Any]:
+        return port_data.setdefault(
+            if_index,
+            {
+                "vlan_pvid": "",
+                "vlan_tagged": set(),
+                "vlan_untagged": set(),
+            },
+        )
+
+    for bridge_port, raw_pvid in q_bridge["q_pvid"].items():
+        if_index = bridge_port_to_if_index.get(str(_int(bridge_port)))
+        pvid = str(_int(raw_pvid))
+        if if_index and pvid != "0":
+            data_for(if_index)["vlan_pvid"] = pvid
+
+    for vlan_id, raw_ports in q_bridge["q_vlan_static_egress_ports"].items():
+        vlan = str(_int(vlan_id))
+        if vlan == "0":
+            continue
+        for bridge_port in _portlist_bridge_ports(raw_ports):
+            if_index = bridge_port_to_if_index.get(bridge_port)
+            if if_index:
+                data_for(if_index)["vlan_tagged"].add(vlan)
+
+    for vlan_id, raw_ports in q_bridge["q_vlan_static_untagged_ports"].items():
+        vlan = str(_int(vlan_id))
+        if vlan == "0":
+            continue
+        for bridge_port in _portlist_bridge_ports(raw_ports):
+            if_index = bridge_port_to_if_index.get(bridge_port)
+            if if_index:
+                item = data_for(if_index)
+                item["vlan_untagged"].add(vlan)
+                item["vlan_tagged"].discard(vlan)
+
+    result: dict[str, dict[str, Any]] = {}
+    for if_index, item in port_data.items():
+        tagged = _sorted_vlan_ids(set(item["vlan_tagged"]))
+        untagged = _sorted_vlan_ids(set(item["vlan_untagged"]))
+        pvid = item["vlan_pvid"]
+        all_vlans = set(tagged) | set(untagged)
+        if pvid:
+            all_vlans.add(pvid)
+        memberships = []
+        for vlan in _sorted_vlan_ids(all_vlans):
+            if vlan == pvid and vlan in untagged:
+                mode = "pvid untagged"
+            elif vlan == pvid and vlan in tagged:
+                mode = "pvid tagged"
+            elif vlan == pvid:
+                mode = "pvid"
+            elif vlan in untagged:
+                mode = "untagged"
+            else:
+                mode = "tagged"
+            memberships.append(
+                {
+                    "vlan": vlan,
+                    "name": vlan_names.get(vlan, ""),
+                    "mode": mode,
+                }
+            )
+        result[if_index] = {
+            "vlan_pvid": pvid,
+            "vlan_tagged": tagged,
+            "vlan_untagged": untagged,
+            "vlans": _sorted_vlan_ids(all_vlans),
+            "vlan_memberships": memberships,
+        }
+    return result
+
+
 def _vendor_from_mac(mac: str) -> str:
     oui = _normalize_mac(mac).replace(":", "")[:6]
     vendors = {
@@ -443,7 +551,9 @@ def _vendor_from_mac(mac: str) -> str:
     return vendors.get(oui, "unknown")
 
 
-async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
+async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = None) -> dict[str, Any]:
+    labeled_endpoint_macs = {_normalize_mac(mac) for mac in (labeled_macs or set())}
+    labeled_endpoint_macs.discard("")
     system, tables, lldp, local_lldp, remote_mgmt, bridge, q_bridge, arp = await asyncio.gather(
         _get_system(config),
         _walk_many(config, TABLE_OIDS),
@@ -489,6 +599,11 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
             "out_errors": _int(tables["if_out_errors"].get(index)),
             "in_discards": _int(tables["if_in_discards"].get(index)),
             "out_discards": _int(tables["if_out_discards"].get(index)),
+            "vlan_pvid": "",
+            "vlan_tagged": [],
+            "vlan_untagged": [],
+            "vlans": [],
+            "vlan_memberships": [],
             "alerting_enabled": True,
         }
         interfaces.append(interface)
@@ -593,27 +708,39 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
         for port, raw_if_index in bridge["base_port_if_index"].items()
         if _int(port) > 0 and _int(raw_if_index) > 0
     }
+    vlan_config_by_if_index = _vlan_config_by_if_index(q_bridge, bridge_port_to_if_index)
+    for if_index, vlan_config in vlan_config_by_if_index.items():
+        if if_index in interface_by_index:
+            interface_by_index[if_index].update(vlan_config)
     ip_by_mac = _arp_ip_by_mac(arp)
     endpoint_rows = _fdb_rows(bridge, q_bridge, bridge_port_to_if_index)
     endpoint_rows.sort(key=lambda row: [int(part) if part.isdigit() else part for part in row["if_index"].split(".")] + [row["mac"]])
     fdb_macs_by_if_index: dict[str, set[str]] = {}
+    fdb_rows_by_if_index: dict[str, list[dict[str, str]]] = {}
     for row in endpoint_rows:
         fdb_macs_by_if_index.setdefault(row["if_index"], set()).add(row["mac"])
+        fdb_rows_by_if_index.setdefault(row["if_index"], []).append(row)
 
     endpoint_count = 0
+    segment_count = 0
     seen_endpoint_macs: set[str] = set()
     occupied_endpoint_if_indexes: set[str] = set()
-    suppressed_if_indexes = {
-        if_index for if_index, macs in fdb_macs_by_if_index.items() if len(macs) > MAX_ENDPOINT_MACS_PER_PORT
+    shared_segment_if_indexes = {
+        if_index
+        for if_index, macs in fdb_macs_by_if_index.items()
+        if len(macs) > MULTI_MAC_SEGMENT_THRESHOLD
     }
     for row in endpoint_rows:
         mac = row["mac"]
         if_index = row["if_index"]
+        port_mac_count = len(fdb_macs_by_if_index.get(if_index, set()))
+        is_labeled_endpoint = mac in labeled_endpoint_macs
+        is_shared_segment_port = if_index in shared_segment_if_indexes
         if (
             mac in seen_endpoint_macs
             or mac in known_macs
             or if_index in lldp_local_if_indexes
-            or if_index in suppressed_if_indexes
+            or (is_shared_segment_port and not is_labeled_endpoint)
         ):
             continue
         local_interface = interface_by_index.get(if_index)
@@ -625,7 +752,6 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
         local_port_name = local_interface.get("name") or f"if{if_index}"
         local_port_alias = (local_interface.get("if_alias") or "").strip()
         vendor = _vendor_from_mac(mac)
-        port_mac_count = len(fdb_macs_by_if_index.get(if_index, set()))
         if local_port_alias:
             name = local_port_alias if port_mac_count == 1 else f"{local_port_alias} {mac}"
         else:
@@ -687,6 +813,88 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
         occupied_endpoint_if_indexes.add(if_index)
         endpoint_count += 1
 
+    for if_index in sorted(shared_segment_if_indexes, key=lambda value: [int(part) if part.isdigit() else part for part in value.split(".")]):
+        if if_index in lldp_local_if_indexes:
+            continue
+        local_interface = interface_by_index.get(if_index)
+        if not local_interface:
+            continue
+        rows = [
+            row
+            for row in fdb_rows_by_if_index.get(if_index, [])
+            if row["mac"] not in known_macs and row["mac"] not in labeled_endpoint_macs
+        ]
+        macs = sorted({row["mac"] for row in rows})
+        if len(macs) <= MULTI_MAC_SEGMENT_THRESHOLD:
+            continue
+        local_port_name = local_interface.get("name") or f"if{if_index}"
+        local_port_alias = (local_interface.get("if_alias") or "").strip()
+        segment_id = _shared_segment_id(device_id, if_index)
+        vlans = sorted({row.get("vlan") or "" for row in rows if row.get("vlan")}, key=lambda value: _int(value, 4096))
+        source_tables = sorted({row.get("source_table") or "FDB" for row in rows})
+        tagged_vlans = local_interface.get("vlan_tagged") or []
+        segment_name = f"{local_port_alias or local_port_name} shared segment"
+        model_parts = [f"{len(macs)} MACs on one switch port"]
+        if vlans:
+            model_parts.append(f"FDB VLANs {', '.join(vlans[:6])}{' +' + str(len(vlans) - 6) if len(vlans) > 6 else ''}")
+        if len(tagged_vlans) > 1:
+            model_parts.append(f"tagged trunk ({len(tagged_vlans)} VLANs)")
+        candidates.append(
+            {
+                "id": segment_id,
+                "name": segment_name,
+                "ip": "unknown",
+                "vendor": "shared-port",
+                "model": " / ".join(model_parts),
+                "status": "observed",
+                "device_type": "segment",
+                "fingerprint": f"shared-mac-port-{device_id}-{if_index}",
+                "chassis_id": "",
+                "mac": "",
+                "observed_ip": "",
+                "observed_vlan": ", ".join(vlans),
+                "observed_source": " / ".join(source_tables),
+                "observed_local_port": local_port_name,
+                "observed_local_port_alias": local_port_alias,
+                "observed_macs": macs,
+                "observed_mac_count": len(macs),
+                "observed_vlans": vlans,
+                "alerting_enabled": False,
+                "layout": {"x": 940, "y": 180 + (endpoint_count + segment_count) * 95, "locked": False, "source": "auto"},
+                "interfaces": [
+                    {
+                        "id": f"{segment_id}-port",
+                        "name": local_port_name,
+                        "if_alias": f"{len(macs)} MACs observed on {local_port_name}",
+                        "admin_status": "unknown",
+                        "oper_status": "observed",
+                        "in_bps": None,
+                        "out_bps": None,
+                        "in_errors": 0,
+                        "out_errors": 0,
+                        "in_discards": 0,
+                        "out_discards": 0,
+                        "alerting_enabled": False,
+                    }
+                ],
+            }
+        )
+        candidate_links.append(
+            {
+                "id": f"segment-link-{device_id}-{segment_id}-{if_index}",
+                "from": device_id,
+                "to": segment_id,
+                "from_interface": local_interface["id"],
+                "to_interface": f"{segment_id}-port",
+                "local_port": local_port_name,
+                "remote_port": f"{len(macs)} MACs",
+                "status": "observed",
+                "evidence": f"Shared MAC segment from {'/'.join(source_tables)}",
+            }
+        )
+        occupied_endpoint_if_indexes.add(if_index)
+        segment_count += 1
+
     described_endpoint_count = 0
     for if_index, local_interface in interface_by_index.items():
         local_port_alias = (local_interface.get("if_alias") or "").strip()
@@ -694,12 +902,18 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
             not local_port_alias
             or if_index in lldp_local_if_indexes
             or if_index in occupied_endpoint_if_indexes
-            or if_index in suppressed_if_indexes
             or local_interface.get("oper_status") != "up"
         ):
             continue
         local_port_name = local_interface.get("name") or f"if{if_index}"
         endpoint_id = f"endpoint-{uuid5(NAMESPACE_DNS, f'{device_id}|portdesc|{if_index}|{local_port_alias}').hex[:12]}"
+        portdesc_macs = sorted(
+            {
+                row["mac"]
+                for row in fdb_rows_by_if_index.get(if_index, [])
+                if row["mac"] not in known_macs
+            }
+        )
         candidates.append(
             {
                 "id": endpoint_id,
@@ -709,14 +923,16 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
                 "model": "Port description endpoint",
                 "status": "observed",
                 "device_type": "endpoint",
-                "fingerprint": f"portdesc-{device_id}-{if_index}",
-                "chassis_id": "",
-                "mac": "",
+                "fingerprint": portdesc_macs[0] if len(portdesc_macs) == 1 else f"portdesc-{device_id}-{if_index}",
+                "chassis_id": portdesc_macs[0] if len(portdesc_macs) == 1 else "",
+                "mac": portdesc_macs[0] if len(portdesc_macs) == 1 else "",
                 "observed_ip": "",
                 "observed_vlan": "",
                 "observed_source": "PORT-DESCRIPTION",
                 "observed_local_port": local_port_name,
                 "observed_local_port_alias": local_port_alias,
+                "observed_macs": portdesc_macs,
+                "observed_mac_count": len(portdesc_macs),
                 "alerting_enabled": False,
                 "layout": {"x": 940, "y": 180 + (endpoint_count + described_endpoint_count) * 95, "locked": False, "source": "auto"},
                 "interfaces": [
@@ -782,11 +998,16 @@ async def discover_seed(config: SnmpSeedConfig) -> dict[str, Any]:
             "lldp_local_port_rows": len(local_lldp["local_port_id"]),
             "bridge_fdb_rows": len(bridge["fdb_port"]),
             "q_bridge_fdb_rows": len(q_bridge["q_fdb_port"]),
+            "q_bridge_pvid_rows": len(q_bridge["q_pvid"]),
+            "q_bridge_vlan_rows": len(q_bridge["q_vlan_static_name"]),
+            "q_bridge_vlan_ports": len(vlan_config_by_if_index),
             "arp_rows": len(arp["ip_net_to_media_phys_address"]),
             "mac_endpoints": endpoint_count,
+            "shared_segments": segment_count,
             "described_endpoints": described_endpoint_count,
             "mac_endpoint_ports_suppressed": sum(
                 1 for macs in fdb_macs_by_if_index.values() if len(macs) > MAX_ENDPOINT_MACS_PER_PORT
             ),
+            "multi_mac_ports_grouped": len(shared_segment_if_indexes),
         },
     }

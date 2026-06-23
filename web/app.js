@@ -11,7 +11,12 @@ const appState = {
   draggingNode: null,
   panningMap: null,
   selectedDeviceIndex: 0,
+  monitorViewMode: window.localStorage?.getItem("netwatch.monitorViewMode") === "grid" ? "grid" : "carousel",
   deviceCarouselDrag: null,
+  deviceCarouselSuppressClick: false,
+  historyDeviceId: "",
+  historyOverlayOpen: false,
+  deviceHistory: null,
   tunnelAnimation: null,
   snapshot: {
     devices: [],
@@ -21,6 +26,7 @@ const appState = {
     metric_catalog: [],
     seeds: [],
     runtime: {},
+    device_labels: {},
     settings: { polling: {}, security: {} }
   }
 };
@@ -39,9 +45,8 @@ const dashboardRgb = [217, 217, 217];
 const patternSectionRatio = 1 / 3;
 const presentationScrollHoldMs = 1000;
 const presentationScrollHold = {
-  key: null,
-  until: 0,
-  releasedKey: null
+  lockedUntil: 0,
+  targetName: ""
 };
 
 function clamp(value, min, max) {
@@ -145,6 +150,7 @@ function enterPresentationMode(view = "home", behavior = "smooth") {
   renderShowcaseTopology();
   renderPresentationDashboard();
   renderPresentationDevices();
+  renderDeviceHistory();
   updatePresentationProgress();
   const topologySection = document.getElementById("topologyShowcase");
   const dashboardSection = document.getElementById("presentationDashboard");
@@ -183,60 +189,110 @@ function getPresentationAnchorTops() {
   ];
 }
 
-function resetPresentationScrollHoldIfAwayFromAnchor() {
-  if (!document.body.classList.contains("presentation-mode")) {
-    presentationScrollHold.key = null;
-    presentationScrollHold.releasedKey = null;
-    presentationScrollHold.until = 0;
+function updatePresentationHashForView(view) {
+  if (view === "home") {
+    if (window.location.hash) history.pushState(null, "", window.location.pathname + window.location.search);
     return;
   }
-
-  const current = window.scrollY;
-  const atAnchor = getPresentationAnchorTops().some((anchor) => Math.abs(current - anchor.top) <= 8);
-  if (!atAnchor) {
-    presentationScrollHold.key = null;
-    presentationScrollHold.releasedKey = null;
-    presentationScrollHold.until = 0;
+  if (window.location.hash !== `#${view}`) {
+    history.pushState(null, "", `#${view}`);
   }
+}
+
+function resetPresentationScrollHoldIfAwayFromAnchor() {
+  if (!document.body.classList.contains("presentation-mode")) {
+    presentationScrollHold.lockedUntil = 0;
+    presentationScrollHold.targetName = "";
+    return;
+  }
+  if (performance.now() >= presentationScrollHold.lockedUntil) {
+    presentationScrollHold.lockedUntil = 0;
+    presentationScrollHold.targetName = "";
+  }
+}
+
+function canScrollElementInDirection(element, deltaY) {
+  if (!element) return false;
+  const maxScroll = element.scrollHeight - element.clientHeight;
+  if (maxScroll <= 2) return false;
+  if (deltaY > 0) return element.scrollTop < maxScroll - 2;
+  return element.scrollTop > 2;
+}
+
+function getInternalScrollTarget(target, deltaY) {
+  if (!(target instanceof Element)) return null;
+  const internal = target.closest(".device-card-scroll, .devices-showcase.is-grid-view .devices-carousel");
+  return canScrollElementInDirection(internal, deltaY) ? internal : null;
+}
+
+function nearestPresentationAnchorIndex(anchors, current) {
+  let nearest = 0;
+  let distance = Number.POSITIVE_INFINITY;
+  anchors.forEach((anchor, index) => {
+    const nextDistance = Math.abs(anchor.top - current);
+    if (nextDistance < distance) {
+      nearest = index;
+      distance = nextDistance;
+    }
+  });
+  return nearest;
+}
+
+function getNextPresentationAnchorIndex(anchors, current, direction) {
+  const anchorTolerance = Math.max(12, window.innerHeight * 0.025);
+  const nearest = nearestPresentationAnchorIndex(anchors, current);
+  const nearestAnchor = anchors[nearest];
+  const atAnchor = Math.abs(nearestAnchor.top - current) <= anchorTolerance;
+
+  if (atAnchor) {
+    return clamp(nearest + (direction === "down" ? 1 : -1), 0, anchors.length - 1);
+  }
+
+  if (direction === "down") {
+    const next = anchors.findIndex((anchor) => anchor.top > current + anchorTolerance);
+    return next === -1 ? anchors.length - 1 : next;
+  }
+
+  for (let index = anchors.length - 1; index >= 0; index -= 1) {
+    if (anchors[index].top < current - anchorTolerance) return index;
+  }
+  return 0;
 }
 
 function maybeHoldPresentationWheel(event) {
   if (!document.body.classList.contains("presentation-mode")) return;
   const target = event.target instanceof Element ? event.target : null;
-  if (target?.closest(".dashboard-card, .device-card-scroll")) return;
+  if (getInternalScrollTarget(target, event.deltaY)) return;
 
   const direction = event.deltaY > 0 ? "down" : event.deltaY < 0 ? "up" : null;
   if (!direction) return;
 
-  const current = window.scrollY;
-  const anchor = getPresentationAnchorTops().find((item) => Math.abs(current - item.top) <= 4);
-  if (!anchor) {
-    resetPresentationScrollHoldIfAwayFromAnchor();
-    return;
-  }
-
-  if ((anchor.name === "home" && direction === "up") || (anchor.name === "devices" && direction === "down")) {
-    return;
-  }
-
-  const key = `${anchor.name}:${direction}`;
-  const now = performance.now();
-  if (presentationScrollHold.releasedKey === key) return;
-
-  if (presentationScrollHold.key === key && now >= presentationScrollHold.until) {
-    presentationScrollHold.key = null;
-    presentationScrollHold.releasedKey = key;
-    presentationScrollHold.until = 0;
-    return;
-  }
-
-  if (presentationScrollHold.key !== key) {
-    presentationScrollHold.key = key;
-    presentationScrollHold.until = now + presentationScrollHoldMs;
-  }
-
   event.preventDefault();
   event.stopPropagation();
+
+  const now = performance.now();
+  if (now < presentationScrollHold.lockedUntil) return;
+
+  const current = window.scrollY;
+  const anchors = getPresentationAnchorTops();
+  const currentIndex = nearestPresentationAnchorIndex(anchors, current);
+  const nextIndex = getNextPresentationAnchorIndex(anchors, current, direction);
+  const currentAnchor = anchors[currentIndex];
+  const nextAnchor = anchors[nextIndex];
+  if (!nextAnchor || nextIndex === currentIndex) return;
+
+  const immediateLandingToMap = currentAnchor.name === "home" && nextAnchor.name === "topology" && direction === "down";
+  window.scrollTo({ top: nextAnchor.top, behavior: "smooth" });
+  window.requestAnimationFrame(updatePresentationProgress);
+  updatePresentationHashForView(nextAnchor.name);
+
+  if (immediateLandingToMap) {
+    presentationScrollHold.lockedUntil = now + 520;
+    presentationScrollHold.targetName = nextAnchor.name;
+  } else {
+    presentationScrollHold.lockedUntil = now + presentationScrollHoldMs + 420;
+    presentationScrollHold.targetName = nextAnchor.name;
+  }
 }
 
 function letterizeLandingTitle() {
@@ -411,6 +467,28 @@ function updateSeedSummary() {
   if (summary) summary.textContent = getSeedSummaryText();
 }
 
+function updatePollActionButtons(isBusy = false) {
+  const polling = getPollingSettings();
+  const enabled = Boolean(polling.backend_auto_poll);
+  const interval = Number(polling.backend_interval_seconds || 30);
+  const label = enabled ? "Stop Poll" : "Run Poll";
+  const title = enabled ? `Polling every ${interval}s` : "Start polling every 30 seconds";
+  ["presentationRunPoll", "runPollButton"].forEach((id) => {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.disabled = isBusy;
+    button.classList.toggle("is-running", enabled);
+    button.setAttribute("aria-pressed", String(enabled));
+    button.title = isBusy ? "Polling in progress" : title;
+    const labelTarget = button.querySelector("span");
+    if (labelTarget) {
+      labelTarget.textContent = label;
+    } else {
+      button.textContent = label;
+    }
+  });
+}
+
 function setLiveSetupOpen(open) {
   const modal = document.getElementById("liveSetupModal");
   if (!modal) return;
@@ -423,11 +501,14 @@ function setLiveSetupOpen(open) {
 
 async function loadSnapshot() {
   appState.snapshot = await apiGet("/api/snapshot");
-  document.getElementById("backendState").textContent = "Connected";
+  const backendState = document.getElementById("backendState");
+  if (backendState) backendState.textContent = "Connected";
   renderAll();
 }
 
 function renderKpis() {
+  const target = document.getElementById("kpiGrid");
+  if (!target) return;
   const managed = getManagedDevices();
   const up = managed.filter((device) => device.status === "up").length;
   const warning = managed.filter((device) => device.status === "warning").length;
@@ -438,10 +519,10 @@ function renderKpis() {
     { label: "Managed devices", value: `${up}/${managed.length}`, trend: `${warning} warning, ${down} down` },
     { label: "Active alerts", value: counts.active, trend: `${counts.acknowledged} acknowledged` },
     { label: "LLDP links", value: appState.snapshot.links.length, trend: `${pendingLinks} pending` },
-    { label: "Event stream", value: "WS", trend: document.getElementById("eventStreamState").textContent }
+    { label: "Event stream", value: "WS", trend: document.getElementById("eventStreamState")?.textContent || "WebSocket pending" }
   ];
 
-  document.getElementById("kpiGrid").innerHTML = kpis
+  target.innerHTML = kpis
     .map(
       (kpi) => `
         <article class="kpi-card">
@@ -664,6 +745,7 @@ function renderPresentationDashboard() {
     .map((event) => `<li><time>${escapeHtml(event.time)}</time> - ${escapeHtml(event.text)}</li>`)
     .join("");
   updateSeedSummary();
+  updatePollActionButtons();
 }
 
 function getDeviceSummary(device) {
@@ -700,6 +782,135 @@ function formatInterfaceTraffic(iface, device) {
   return `${formatBps(iface.in_bps)} in / ${formatBps(iface.out_bps)} out`;
 }
 
+function normalizeMacKey(value) {
+  const text = String(value || "").toLowerCase().replace(/[^a-f0-9]/g, "");
+  return text.length === 12 ? text : "";
+}
+
+function formatMacKey(value) {
+  const key = normalizeMacKey(value);
+  if (!key) return "";
+  return key.match(/.{1,2}/g).join(":");
+}
+
+function isSnmpNamedSwitch(device) {
+  if (!device || device.device_type === "endpoint" || device.device_type === "segment") return false;
+  if (device.name_source === "mac-label") return false;
+  if (device.seed_key || device.lldp_sys_name || device.lldp_mgmt_ip) return true;
+  if (String(device.id || "").startsWith("live-")) return true;
+  return (device.interfaces || []).length > 0 && Boolean(device.ip && device.ip !== "unknown");
+}
+
+function getDeviceMacCandidates(device) {
+  const candidates = [
+    device?.asset_mac,
+    device?.mac,
+    device?.observed_mac,
+    device?.chassis_id,
+    device?.fingerprint,
+    ...(device?.observed_macs || [])
+  ];
+  const seen = new Set();
+  return candidates
+    .map(formatMacKey)
+    .filter((mac) => {
+      const key = normalizeMacKey(mac);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function getDeviceMac(device) {
+  return getDeviceMacCandidates(device)[0] || "";
+}
+
+function getMacLabelForMac(mac) {
+  const key = normalizeMacKey(mac);
+  return appState.snapshot.mac_labels?.[key] || {};
+}
+
+function getMacLabel(device, mac = "") {
+  const key = normalizeMacKey(mac || getDeviceMac(device));
+  return appState.snapshot.mac_labels?.[key] || device?.asset_label || {};
+}
+
+function getDeviceLabel(device) {
+  return appState.snapshot.device_labels?.[device?.id] || device?.device_label || {};
+}
+
+function renderMacLabelEditor(device) {
+  if (isSnmpNamedSwitch(device)) return "";
+  const macs = getDeviceMacCandidates(device);
+  const hasMacTarget = macs.length > 0;
+  const mac = macs[0] || "";
+  const label = hasMacTarget ? getMacLabel(device) : getDeviceLabel(device);
+  const macInput = macs.length > 1
+    ? `
+      <label>
+        <span>MAC address</span>
+        <select name="mac">
+          ${macs
+            .map((candidate) => {
+              const candidateLabel = getMacLabelForMac(candidate);
+              const suffix = candidateLabel.name ? ` - ${candidateLabel.name}` : "";
+              return `<option value="${escapeHtml(candidate)}" ${normalizeMacKey(candidate) === normalizeMacKey(mac) ? "selected" : ""}>${escapeHtml(candidate + suffix)}</option>`;
+            })
+            .join("")}
+        </select>
+      </label>
+    `
+    : hasMacTarget
+      ? `<input name="mac" type="hidden" value="${escapeHtml(mac)}" />`
+      : `<input name="device_id" type="hidden" value="${escapeHtml(device.id || "")}" />`;
+  const descriptor = macs.length > 1
+    ? `${macs.length} observed MACs available`
+    : hasMacTarget
+      ? `${mac} follows this asset across switch ports.`
+      : "Saved to this observed port-description endpoint; no MAC is available yet.";
+  return `
+    <form class="mac-label-form" data-mac-label-form data-label-target="${hasMacTarget ? "mac" : "device"}" data-mac="${escapeHtml(mac)}" data-device-id="${escapeHtml(device.id || "")}">
+      ${macInput}
+      <label>
+        <span>Asset name</span>
+        <input name="name" type="text" maxlength="160" value="${escapeHtml(label.name || "")}" placeholder="${escapeHtml(device.name || "Endpoint")}" />
+      </label>
+      <label>
+        <span>Description</span>
+        <input name="description" type="text" maxlength="400" value="${escapeHtml(label.description || "")}" placeholder="Saved by MAC address" />
+      </label>
+      <button type="submit">Save MAC</button>
+      <small data-mac-label-status>${escapeHtml(descriptor)}</small>
+    </form>
+  `;
+}
+
+function compactList(values, limit = 5) {
+  const items = (values || []).filter(Boolean).map(String);
+  if (items.length <= limit) return items.join(", ");
+  return `${items.slice(0, limit).join(", ")} +${items.length - limit}`;
+}
+
+function formatInterfaceVlans(iface) {
+  const pvid = iface.vlan_pvid ? `PVID ${iface.vlan_pvid}` : "";
+  const tagged = compactList(iface.vlan_tagged || []);
+  const untagged = compactList(iface.vlan_untagged || []);
+  const parts = [];
+  if (pvid) parts.push(pvid);
+  if (untagged) parts.push(`untagged ${untagged}`);
+  if (tagged) parts.push(`tagged ${tagged}`);
+  return parts.join(" / ") || "VLAN n/a";
+}
+
+function summarizeDeviceVlans(device) {
+  const vlans = new Set();
+  (device.interfaces || []).forEach((iface) => {
+    (iface.vlans || []).forEach((vlan) => vlans.add(String(vlan)));
+    if (iface.vlan_pvid) vlans.add(String(iface.vlan_pvid));
+  });
+  return compactList([...vlans].sort((a, b) => Number(a) - Number(b)), 8) || "n/a";
+}
+
 function renderPresentationDeviceInterfaces(device) {
   const interfaces = device.interfaces || [];
   if (interfaces.length === 0) {
@@ -714,6 +925,7 @@ function renderPresentationDeviceInterfaces(device) {
             <strong>${escapeHtml(iface.name || iface.if_descr || "Interface")}</strong>
             <span>${escapeHtml(iface.if_alias || iface.if_descr || "no alias")}</span>
             <span>${escapeHtml(formatInterfaceTraffic(iface, device))}</span>
+            <span>${escapeHtml(formatInterfaceVlans(iface))}</span>
             ${iface.traffic_source === "switch-port" ? `<span>${escapeHtml(iface.traffic_note || "estimated from switch port")}</span>` : ""}
             <span>${escapeHtml(String((iface.in_errors || 0) + (iface.out_errors || 0)))} errors / ${escapeHtml(String((iface.in_discards || 0) + (iface.out_discards || 0)))} discards</span>
           </div>
@@ -725,9 +937,12 @@ function renderPresentationDeviceInterfaces(device) {
 }
 
 function renderPresentationDevices() {
+  const section = document.getElementById("presentationDevices");
   const track = document.getElementById("devicesTrack");
   const carousel = document.getElementById("devicesCarousel");
-  if (!track || !carousel) return;
+  if (!section || !track || !carousel) return;
+  section.classList.toggle("is-grid-view", appState.monitorViewMode === "grid");
+  updateMonitorViewControls();
 
   const devices = getDevices();
   const selectedFromId = devices.findIndex((device) => device.id === appState.selectedDeviceId);
@@ -755,6 +970,8 @@ function renderPresentationDevices() {
       const endpointTraffic = getEndpointTraffic(device);
       const sourceLabel = device.device_type === "endpoint"
         ? `${device.observed_source || "MAC table"}${device.observed_vlan ? ` / VLAN ${device.observed_vlan}` : ""}`
+        : device.device_type === "segment"
+          ? `${device.observed_mac_count || 0} MACs / ${device.observed_source || "MAC table"}`
         : device.lldp_sys_name
           ? "LLDP neighbor"
           : "SNMP seed";
@@ -765,8 +982,12 @@ function renderPresentationDevices() {
       const trafficSourceLabel = endpointTraffic
         ? `${endpointTraffic.switch_name || "switch"} / ${endpointTraffic.switch_port || portLabel}${endpointTraffic.shared_port ? ` / ${endpointTraffic.shared_endpoint_count} endpoints` : ""}`
         : "direct interface counters";
+      const vlanSummary = summarizeDeviceVlans(device);
+      const observedMacs = device.observed_macs || [];
+      const observedMacList = observedMacs.slice(0, 6).map((mac) => escapeHtml(mac)).join("<br>");
+      const observedMacMore = observedMacs.length > 6 ? `<br>+${observedMacs.length - 6}` : "";
       return `
-        <article class="device-card" data-device-card data-device-index="${index}">
+        <article class="device-card" data-device-card data-device-index="${index}" data-device-card-id="${escapeHtml(device.id)}">
           <header class="device-card-head">
             <h3>${escapeHtml(device.name || "Unknown device")}</h3>
             <span class="device-card-status ${escapeHtml(device.status || "unknown")}">${escapeHtml(statusLabel(device.status))}</span>
@@ -779,13 +1000,17 @@ function renderPresentationDevices() {
               <div class="device-fact"><span>Management IP</span><strong>${escapeHtml(device.ip || "unknown")}</strong></div>
               <div class="device-fact"><span>Vendor</span><strong>${escapeHtml(device.vendor || "unknown")}</strong></div>
               <div class="device-fact"><span>Model</span><strong>${escapeHtml(device.model || "unknown")}</strong></div>
+              ${device.description ? `<div class="device-fact"><span>Description</span><strong>${escapeHtml(device.description)}</strong></div>` : ""}
               <div class="device-fact"><span>Source</span><strong>${escapeHtml(sourceLabel)}</strong></div>
               <div class="device-fact"><span>Switch port</span><strong>${escapeHtml(portLabel)}</strong></div>
+              ${device.device_type === "segment" ? `<div class="device-fact"><span>Observed MACs</span><strong>${observedMacList}${observedMacMore}</strong></div>` : ""}
               <div class="device-fact"><span>Interfaces</span><strong>${summary.operUp}/${interfaces.length} oper up</strong></div>
               <div class="device-fact"><span>Traffic</span><strong>${trafficLabel}</strong></div>
+              <div class="device-fact"><span>VLANs</span><strong>${escapeHtml(vlanSummary)}</strong></div>
               <div class="device-fact"><span>Traffic source</span><strong>${escapeHtml(trafficSourceLabel)}</strong></div>
               <div class="device-fact"><span>Errors</span><strong>${summary.errors} errors<br>${summary.discards} discards</strong></div>
             </div>
+            ${renderMacLabelEditor(device)}
             <ol class="device-interface-list">
               ${renderPresentationDeviceInterfaces(device)}
             </ol>
@@ -797,6 +1022,26 @@ function renderPresentationDevices() {
     .join("");
 
   bindDeviceCarousel();
+  bindMacLabelForms(track);
+  updateDeviceCarousel();
+}
+
+function updateMonitorViewControls() {
+  document.querySelectorAll("[data-monitor-view]").forEach((button) => {
+    const isActive = button.dataset.monitorView === appState.monitorViewMode;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  });
+}
+
+function setMonitorViewMode(mode) {
+  appState.monitorViewMode = mode === "grid" ? "grid" : "carousel";
+  try {
+    window.localStorage.setItem("netwatch.monitorViewMode", appState.monitorViewMode);
+  } catch {
+    // Ignore private-mode storage failures; the in-memory setting still works.
+  }
+  renderPresentationDevices();
   updateDeviceCarousel();
 }
 
@@ -811,15 +1056,153 @@ function setSelectedDeviceIndex(index) {
   updateDeviceCarousel();
 }
 
+function openMonitorForDevice(deviceId, behavior = "smooth") {
+  if (!getDeviceById(deviceId)) return;
+  appState.selectedDeviceId = deviceId;
+  const index = getDevices().findIndex((device) => device.id === deviceId);
+  if (index >= 0) appState.selectedDeviceIndex = index;
+  renderPresentationDevices();
+  updateDeviceCarousel();
+  switchView("devices", behavior);
+}
+
+function setHistoryOverlayOpen(open, updateHash = true) {
+  appState.historyOverlayOpen = open;
+  document.body.classList.toggle("history-overlay-open", open);
+  if (open) {
+    if (updateHash && window.location.hash !== "#history") {
+      history.pushState(null, "", "#history");
+    }
+  } else if (updateHash && window.location.hash === "#history") {
+    history.pushState(null, "", "#devices");
+  }
+}
+
+async function openDeviceHistory(deviceId, behavior = "smooth") {
+  if (!getDeviceById(deviceId)) return;
+  appState.selectedDeviceId = deviceId;
+  appState.historyDeviceId = deviceId;
+  const index = getDevices().findIndex((device) => device.id === deviceId);
+  if (index >= 0) appState.selectedDeviceIndex = index;
+  enterPresentationMode("devices", behavior);
+  try {
+    appState.deviceHistory = await apiGet(`/api/devices/${encodeURIComponent(deviceId)}/history`);
+  } catch (error) {
+    appState.deviceHistory = { error: error.message, device: getDeviceById(deviceId), interfaces: [] };
+  }
+  renderDeviceHistory();
+  setHistoryOverlayOpen(true);
+}
+
+function historySampleValue(sample) {
+  const inBps = Number(sample?.in_bps || 0);
+  const outBps = Number(sample?.out_bps || 0);
+  return Math.max(0, inBps, outBps);
+}
+
+function historyBuckets(samples, columns = 18) {
+  const now = Date.now() / 1000;
+  const start = now - 3600;
+  const width = 3600 / columns;
+  const buckets = Array.from({ length: columns }, () => []);
+  samples.forEach((sample) => {
+    const ts = Number(sample.ts || 0);
+    if (!Number.isFinite(ts)) return;
+    const index = clamp(Math.floor((ts - start) / width), 0, columns - 1);
+    buckets[index].push(historySampleValue(sample));
+  });
+  return buckets.map((bucket) => (bucket.length ? Math.max(...bucket) : 0));
+}
+
+function renderHistoryGrid(samples, capacity) {
+  const columns = 18;
+  const rows = 7;
+  const values = historyBuckets(samples, columns);
+  const maxObserved = Math.max(...values, 1);
+  const maxCapacity = Number(capacity || 0) > 0 ? Number(capacity) * 1_000_000 : 0;
+  const denominator = Math.max(maxObserved, maxCapacity * 0.18, 1);
+  let cells = "";
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const normalized = values[column] / denominator;
+      const height = Math.max(values[column] > 0 ? 1 : 0, Math.round(normalized * rows));
+      const active = rows - row <= height;
+      cells += `<span class="history-pill ${active ? "is-active" : ""}" aria-hidden="true"></span>`;
+    }
+  }
+  return cells;
+}
+
+function renderDeviceHistory() {
+  const section = document.getElementById("deviceHistory");
+  const title = document.getElementById("historyDeviceName");
+  const meta = document.getElementById("historyDeviceMeta");
+  const list = document.getElementById("historyInterfaceList");
+  if (!section || !title || !meta || !list) return;
+
+  const device = appState.deviceHistory?.device || getDeviceById(appState.historyDeviceId || appState.selectedDeviceId);
+  if (!device) {
+    title.textContent = "Interface History";
+    meta.textContent = "";
+    list.innerHTML = `<article class="history-empty">No device selected</article>`;
+    return;
+  }
+
+  title.textContent = device.name || "Interface History";
+  meta.textContent = `${device.ip || "unknown"} / ${device.vendor || "unknown"} / ${device.model || "unknown"}`;
+  const interfaces = appState.deviceHistory?.interfaces || [];
+  if (appState.deviceHistory?.error) {
+    list.innerHTML = `<article class="history-empty">${escapeHtml(appState.deviceHistory.error)}</article>`;
+    return;
+  }
+  if (interfaces.length === 0) {
+    list.innerHTML = `<article class="history-empty">No interfaces available</article>`;
+    return;
+  }
+
+  list.innerHTML = interfaces
+    .map((iface) => {
+      const samples = iface.samples || [];
+      const latest = samples[samples.length - 1] || {};
+      return `
+        <article class="history-interface-card">
+          <div class="history-interface-meta">
+            <span>${escapeHtml(iface.name || "Interface")}</span>
+            <strong>${escapeHtml(formatBps(historySampleValue(latest)))}</strong>
+            <small>${escapeHtml(iface.if_alias || "no alias")} / ${escapeHtml(iface.admin_status || "n/a")} ${escapeHtml(iface.oper_status || "n/a")}</small>
+          </div>
+          <div class="history-pill-grid" aria-label="${escapeHtml(iface.name || "Interface")} last hour traffic">
+            ${renderHistoryGrid(samples, iface.if_high_speed)}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
 function updateDeviceCarousel(dragOffset = 0) {
+  const section = document.getElementById("presentationDevices");
   const carousel = document.getElementById("devicesCarousel");
   const track = document.getElementById("devicesTrack");
   if (!carousel || !track) return;
   const cards = Array.from(track.querySelectorAll("[data-device-card]"));
   const prev = document.getElementById("devicePrevButton");
   const next = document.getElementById("deviceNextButton");
+  const isGrid = appState.monitorViewMode === "grid";
+
+  section?.classList.toggle("is-grid-view", isGrid);
+  updateMonitorViewControls();
 
   if (cards.length === 0) {
+    if (prev) prev.disabled = true;
+    if (next) next.disabled = true;
+    return;
+  }
+
+  if (isGrid) {
+    track.style.transform = "";
+    track.classList.remove("is-dragging");
+    cards.forEach((card) => card.classList.add("is-active"));
     if (prev) prev.disabled = true;
     if (next) next.disabled = true;
     return;
@@ -847,27 +1230,38 @@ function bindDeviceCarousel() {
   track.dataset.bound = "true";
 
   track.addEventListener("pointerdown", (event) => {
+    if (appState.monitorViewMode !== "carousel") return;
     if (event.button !== 0) return;
+    if (event.target.closest("input, textarea, button, select, label, [data-mac-label-form]")) return;
     appState.deviceCarouselDrag = {
       pointerId: event.pointerId,
       startX: event.clientX,
-      currentX: event.clientX
+      currentX: event.clientX,
+      moved: false
     };
     track.classList.add("is-dragging");
     track.setPointerCapture(event.pointerId);
   });
 
   track.addEventListener("pointermove", (event) => {
+    if (appState.monitorViewMode !== "carousel") return;
     const drag = appState.deviceCarouselDrag;
     if (!drag || drag.pointerId !== event.pointerId) return;
     drag.currentX = event.clientX;
+    if (Math.abs(drag.currentX - drag.startX) > 8) drag.moved = true;
     updateDeviceCarousel(drag.currentX - drag.startX);
   });
 
   function finishDrag(event) {
+    if (appState.monitorViewMode !== "carousel") {
+      appState.deviceCarouselDrag = null;
+      track.classList.remove("is-dragging");
+      return;
+    }
     const drag = appState.deviceCarouselDrag;
     if (!drag || drag.pointerId !== event.pointerId) return;
     const delta = drag.currentX - drag.startX;
+    appState.deviceCarouselSuppressClick = drag.moved || Math.abs(delta) > 8;
     appState.deviceCarouselDrag = null;
     track.classList.remove("is-dragging");
     if (delta < -80) {
@@ -881,6 +1275,19 @@ function bindDeviceCarousel() {
 
   track.addEventListener("pointerup", finishDrag);
   track.addEventListener("pointercancel", finishDrag);
+  track.addEventListener("click", (event) => {
+    if (event.target.closest("input, textarea, button, select, label, [data-mac-label-form]")) return;
+    const card = event.target.closest("[data-device-card]");
+    if (!card || !track.contains(card)) return;
+    if (appState.deviceCarouselSuppressClick) {
+      appState.deviceCarouselSuppressClick = false;
+      return;
+    }
+    const index = Number(card.dataset.deviceIndex || 0);
+    setSelectedDeviceIndex(index);
+    const deviceId = card.dataset.deviceCardId || getDevices()[index]?.id;
+    if (deviceId) openDeviceHistory(deviceId);
+  });
 }
 
 function bindAlertActionButtons(scope = document) {
@@ -894,6 +1301,39 @@ function bindAlertActionButtons(scope = document) {
       const result = await apiPost(`/api/alerts/${alertId}/${action}`);
       appState.snapshot = result.snapshot;
       renderAll();
+    });
+  });
+}
+
+function bindMacLabelForms(scope = document) {
+  scope.querySelectorAll("[data-mac-label-form]").forEach((form) => {
+    if (form.dataset.bound === "true") return;
+    form.dataset.bound = "true";
+    form.addEventListener("click", (event) => event.stopPropagation());
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const status = form.querySelector("[data-mac-label-status]");
+      const submit = form.querySelector("button[type='submit']");
+      const isDeviceLabel = form.dataset.labelTarget === "device";
+      const payload = {
+        ...(isDeviceLabel
+          ? { device_id: form.elements.device_id?.value || form.dataset.deviceId || "" }
+          : { mac: form.elements.mac?.value || form.dataset.mac || "" }),
+        name: form.elements.name?.value?.trim() || "",
+        description: form.elements.description?.value?.trim() || ""
+      };
+      if (status) status.textContent = isDeviceLabel ? "Saving device label..." : "Saving MAC label...";
+      if (submit) submit.disabled = true;
+      try {
+        const result = await apiPostJson(isDeviceLabel ? "/api/device-labels" : "/api/mac-labels", payload);
+        appState.snapshot = result.snapshot;
+        renderAll();
+      } catch (error) {
+        if (status) status.textContent = error.message;
+      } finally {
+        if (submit) submit.disabled = false;
+      }
     });
   });
 }
@@ -973,8 +1413,10 @@ function bindDashboardCardReveal(scope = document) {
 }
 
 function renderDashboardDevices() {
+  const target = document.getElementById("dashboardDeviceList");
+  if (!target) return;
   if (getDevices().length === 0) {
-    document.getElementById("dashboardDeviceList").innerHTML = `
+    target.innerHTML = `
       <article class="device-row">
         <div class="device-name">
           <strong>No live devices yet</strong>
@@ -984,7 +1426,7 @@ function renderDashboardDevices() {
     `;
     return;
   }
-  document.getElementById("dashboardDeviceList").innerHTML = getDevices()
+  target.innerHTML = getDevices()
     .map(
       (device) => `
         <article class="device-row">
@@ -1002,7 +1444,9 @@ function renderDashboardDevices() {
 }
 
 function renderEvents() {
-  document.getElementById("eventList").innerHTML = appState.snapshot.events
+  const target = document.getElementById("eventList");
+  if (!target) return;
+  target.innerHTML = appState.snapshot.events
     .map(
       (event) => `
         <li>
@@ -1015,17 +1459,21 @@ function renderEvents() {
 }
 
 function renderDevicesTable() {
+  const table = document.getElementById("devicesTable");
+  const detailTitle = document.getElementById("deviceDetailTitle");
+  const detail = document.getElementById("deviceDetail");
+  if (!table || !detailTitle || !detail) return;
   if (getDevices().length === 0) {
-    document.getElementById("devicesTable").innerHTML = `
+    table.innerHTML = `
       <tr>
         <td colspan="4">No live devices yet. Add a seed switch from Settings.</td>
       </tr>
     `;
-    document.getElementById("deviceDetailTitle").textContent = "No device selected";
-    document.getElementById("deviceDetail").innerHTML = "";
+    detailTitle.textContent = "No device selected";
+    detail.innerHTML = "";
     return;
   }
-  document.getElementById("devicesTable").innerHTML = getDevices()
+  table.innerHTML = getDevices()
     .map(
       (device) => `
         <tr class="clickable-row" data-device-id="${device.id}">
@@ -1047,19 +1495,24 @@ function renderDevicesTable() {
 }
 
 function renderDeviceDetail() {
+  const detailTitle = document.getElementById("deviceDetailTitle");
+  const detail = document.getElementById("deviceDetail");
+  if (!detailTitle || !detail) return;
   const device = getDeviceById(appState.selectedDeviceId) || getDevices()[0];
   if (!device) return;
   appState.selectedDeviceId = device.id;
   const endpointTraffic = getEndpointTraffic(device);
-  document.getElementById("deviceDetailTitle").textContent = device.name;
-  document.getElementById("deviceDetail").innerHTML = `
+  detailTitle.textContent = device.name;
+  detail.innerHTML = `
     <dl class="settings-list">
       <div><dt>Management IP</dt><dd>${device.ip}</dd></div>
       <div><dt>Vendor</dt><dd>${device.vendor}</dd></div>
       <div><dt>Model</dt><dd>${device.model}</dd></div>
       <div><dt>Fingerprint</dt><dd>${device.fingerprint}</dd></div>
+      ${device.description ? `<div><dt>Description</dt><dd>${escapeHtml(device.description)}</dd></div>` : ""}
       ${endpointTraffic ? `<div><dt>Traffic source</dt><dd>${escapeHtml(endpointTraffic.switch_name || "switch")} / ${escapeHtml(endpointTraffic.switch_port || "port")} (${escapeHtml(endpointTraffic.note || "estimated")})</dd></div>` : ""}
     </dl>
+    ${renderMacLabelEditor(device)}
     <div class="interface-list">
       ${device.interfaces
         .map(
@@ -1072,6 +1525,7 @@ function renderDeviceDetail() {
               <span class="status-pill ${iface.admin_status === "up" ? "up" : "neutral"}">admin ${iface.admin_status}</span>
               <span class="status-pill ${iface.oper_status === "up" ? "up" : iface.oper_status === "down" ? "down" : "neutral"}">oper ${iface.oper_status}</span>
               <span class="muted">${escapeHtml(formatInterfaceTraffic(iface, device)).replace(" / ", "<br>")}</span>
+              <span class="muted">${escapeHtml(formatInterfaceVlans(iface)).replaceAll(" / ", "<br>")}</span>
               <span class="muted">${iface.in_errors + iface.out_errors} errors<br>${iface.in_discards + iface.out_discards} discards</span>
               <span class="muted">${formatSpeed(iface.if_high_speed)}</span>
             </article>
@@ -1080,12 +1534,14 @@ function renderDeviceDetail() {
         .join("")}
     </div>
   `;
+  bindMacLabelForms(detail);
 }
 
 function renderTopology() {
   const canvas = document.getElementById("topologyCanvas");
   const svg = document.getElementById("linkLayer");
   const nodes = document.getElementById("nodeLayer");
+  if (!canvas || !svg || !nodes) return;
   const width = canvas.clientWidth || 900;
   const height = canvas.clientHeight || 560;
   const nodeWidth = 165;
@@ -1342,11 +1798,15 @@ function layoutTopologyComponent(component, adjacency, deviceMap, spacingX, spac
 }
 
 function isTopologyEndpoint(device) {
-  return device?.device_type === "endpoint" || device?.status === "observed" || String(device?.id || "").startsWith("endpoint-");
+  return device?.device_type === "endpoint" || String(device?.id || "").startsWith("endpoint-");
+}
+
+function isTopologySegment(device) {
+  return device?.device_type === "segment" || String(device?.id || "").startsWith("segment-");
 }
 
 function isTopologyPeripheral(device) {
-  return isTopologyEndpoint(device);
+  return isTopologyEndpoint(device) || isTopologySegment(device);
 }
 
 function getTopologyParentMap(devices, links, deviceMap) {
@@ -2008,6 +2468,9 @@ function bindShowcaseDrag() {
       appState.draggingNode = {
         id: node.dataset.showcaseNode,
         pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        moved: false,
         offsetX: (event.clientX - nodeRect.left) / zoom,
         offsetY: (event.clientY - nodeRect.top) / zoom,
         width: node.offsetWidth,
@@ -2020,6 +2483,10 @@ function bindShowcaseDrag() {
     node.addEventListener("pointermove", (event) => {
       const drag = appState.draggingNode;
       if (!drag || drag.pointerId !== event.pointerId || drag.id !== node.dataset.showcaseNode) return;
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 6) {
+        drag.moved = true;
+      }
+      if (!drag.moved) return;
       const stage = document.getElementById("showcaseMap");
       const stageRect = stage.getBoundingClientRect();
       const zoom = appState.topologyZoom || 1;
@@ -2035,10 +2502,15 @@ function bindShowcaseDrag() {
     });
 
     node.addEventListener("pointerup", (event) => {
-      if (appState.draggingNode?.pointerId === event.pointerId) {
+      const drag = appState.draggingNode;
+      if (drag?.pointerId === event.pointerId) {
         node.classList.remove("is-dragging");
         appState.draggingNode = null;
-        saveTopologyLayoutSoon();
+        if (drag.moved) {
+          saveTopologyLayoutSoon();
+        } else if (drag.id) {
+          openMonitorForDevice(drag.id);
+        }
       }
     });
 
@@ -2166,15 +2638,31 @@ function renderShowcaseTopology() {
       const status = device.status || "unknown";
       const model = device.model || "Unknown";
       const endpointTraffic = getEndpointTraffic(device);
-      const source = device.device_type === "endpoint" ? device.mac || device.fingerprint : device.ip;
+      const source = device.device_type === "endpoint"
+        ? device.mac || device.fingerprint
+        : device.device_type === "segment"
+          ? `${device.observed_mac_count || 0} MACs`
+          : device.ip;
       const metaLines = device.device_type === "endpoint"
         ? [
             source || "unknown",
             device.observed_local_port || device.vendor || "observed endpoint",
             endpointTraffic ? formatEndpointTraffic(device) : (device.vendor || model)
           ]
+        : device.device_type === "segment"
+          ? [
+              source || "multi-MAC",
+              device.observed_local_port || "shared switch port",
+              device.observed_local_port_alias || model
+            ]
         : [source || "unknown", device.vendor || "Unknown", model];
-      const kindClass = isTopologyEndpoint(device) ? "is-endpoint" : device.status === "pending" ? "is-pending" : "is-seed";
+      const kindClass = isTopologySegment(device)
+        ? "is-segment"
+        : isTopologyEndpoint(device)
+          ? "is-endpoint"
+          : device.status === "pending"
+            ? "is-pending"
+            : "is-seed";
       return `
         <button class="showcase-node ${status} ${kindClass}" type="button" style="left:${pos.x}px;top:${pos.y}px" data-showcase-node="${device.id}">
           <span class="showcase-node-title">${escapeHtml(device.name || "Unknown")}</span>
@@ -2245,8 +2733,10 @@ function startDotTunnel() {
 }
 
 function renderAlerts() {
+  const target = document.getElementById("alertList");
+  if (!target) return;
   if (appState.snapshot.alerts.length === 0) {
-    document.getElementById("alertList").innerHTML = `
+    target.innerHTML = `
       <article class="alert-item">
         <div>
           <strong>No active alerts</strong>
@@ -2256,7 +2746,7 @@ function renderAlerts() {
     `;
     return;
   }
-  document.getElementById("alertList").innerHTML = appState.snapshot.alerts
+  target.innerHTML = appState.snapshot.alerts
     .map((alert) => {
       const device = getDeviceById(alert.device_id);
       const canAck = alert.state === "active";
@@ -2277,23 +2767,35 @@ function renderAlerts() {
     })
     .join("");
 
-  bindAlertActionButtons(document.getElementById("alertList"));
+  bindAlertActionButtons(target);
 }
 
 function renderSettings() {
   const polling = appState.snapshot.settings.polling || {};
   const security = appState.snapshot.settings.security || {};
-  document.getElementById("pollingSettings").innerHTML = Object.entries(polling)
-    .map(([key, value]) => `<div><dt>${key.replaceAll("_", " ")}</dt><dd>${value}</dd></div>`)
-    .join("");
-  document.getElementById("securitySettings").innerHTML = Object.entries(security)
-    .map(([key, value]) => `<div><dt>${key.replaceAll("_", " ")}</dt><dd>${value}</dd></div>`)
-    .join("");
-  document.getElementById("metricCatalog").innerHTML = appState.snapshot.metric_catalog
-    .map((metric) => `<span class="metric-chip">${metric}</span>`)
-    .join("");
-  document.getElementById("liveModeBadge").textContent = `${appState.snapshot.mode || "mock"} mode`;
-  document.getElementById("liveModeBadge").className = `status-pill ${appState.snapshot.mode === "live" ? "up" : "neutral"}`;
+  const pollingSettings = document.getElementById("pollingSettings");
+  const securitySettings = document.getElementById("securitySettings");
+  const metricCatalog = document.getElementById("metricCatalog");
+  const liveModeBadge = document.getElementById("liveModeBadge");
+  if (pollingSettings) {
+    pollingSettings.innerHTML = Object.entries(polling)
+      .map(([key, value]) => `<div><dt>${key.replaceAll("_", " ")}</dt><dd>${value}</dd></div>`)
+      .join("");
+  }
+  if (securitySettings) {
+    securitySettings.innerHTML = Object.entries(security)
+      .map(([key, value]) => `<div><dt>${key.replaceAll("_", " ")}</dt><dd>${value}</dd></div>`)
+      .join("");
+  }
+  if (metricCatalog) {
+    metricCatalog.innerHTML = appState.snapshot.metric_catalog
+      .map((metric) => `<span class="metric-chip">${metric}</span>`)
+      .join("");
+  }
+  if (liveModeBadge) {
+    liveModeBadge.textContent = `${appState.snapshot.mode || "mock"} mode`;
+    liveModeBadge.className = `status-pill ${appState.snapshot.mode === "live" ? "up" : "neutral"}`;
+  }
   const backendPoll = Boolean(polling.backend_auto_poll);
   const interval = Number(polling.backend_interval_seconds || 30);
   const legacyToggle = document.getElementById("autoPollToggle");
@@ -2303,10 +2805,21 @@ function renderSettings() {
   if (presentationToggle) presentationToggle.checked = backendPoll;
   if (presentationInterval) presentationInterval.value = String(interval);
   updateSeedSummary();
+  updatePollActionButtons();
   syncSeedVersionFields();
 }
 
 function switchView(view, behavior = "smooth") {
+  if (view !== "history") {
+    setHistoryOverlayOpen(false, false);
+  }
+
+  if (view === "history") {
+    const deviceId = appState.historyDeviceId || appState.selectedDeviceId || getDevices()[0]?.id;
+    if (deviceId) openDeviceHistory(deviceId, behavior);
+    return;
+  }
+
   if (view === "home") {
     enterPresentationMode("home", behavior);
     return;
@@ -2327,26 +2840,30 @@ function switchView(view, behavior = "smooth") {
     return;
   }
 
-  if (!viewMeta[view]) return;
-  enterAppMode(view);
-  document.querySelectorAll(".nav-item").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.view === view);
-  });
-  document.querySelectorAll("[data-view-panel]").forEach((panel) => {
-    panel.classList.toggle("is-active", panel.dataset.viewPanel === view);
-  });
-  const [eyebrow, title] = viewMeta[view];
-  document.getElementById("viewEyebrow").textContent = eyebrow;
-  document.getElementById("viewTitle").textContent = title;
-  if (window.location.hash !== `#${view}`) {
-    history.pushState(null, "", `#${view}`);
-  }
+  enterPresentationMode("dashboard", behavior);
 }
 
 async function runPoll() {
   const result = await apiPost("/api/poll");
   appState.snapshot = result.snapshot;
   renderAll();
+}
+
+async function toggleBackendPoll() {
+  const polling = getPollingSettings();
+  const enabled = Boolean(polling.backend_auto_poll);
+  const interval = Number(polling.backend_interval_seconds || 30) || 30;
+  updatePollActionButtons(true);
+  try {
+    if (enabled) {
+      await setBackendPolling(false, interval);
+      return;
+    }
+    await runPoll();
+    await setBackendPolling(true, 30);
+  } finally {
+    updatePollActionButtons(false);
+  }
 }
 
 async function runDiscovery() {
@@ -2469,7 +2986,8 @@ function startAutoPoll() {
     try {
       await runPoll();
     } catch (error) {
-      document.getElementById("eventStreamState").textContent = `Poll failed: ${error.message}`;
+      const streamState = document.getElementById("eventStreamState");
+      if (streamState) streamState.textContent = `Poll failed: ${error.message}`;
     }
   }, 30000);
 }
@@ -2508,6 +3026,7 @@ function renderAll() {
   renderShowcaseTopology();
   renderPresentationDashboard();
   renderPresentationDevices();
+  renderDeviceHistory();
   renderAlerts();
   renderSettings();
 }
@@ -2519,35 +3038,39 @@ function bindEvents() {
   document.querySelectorAll("[data-view-target]").forEach((item) => {
     item.addEventListener("click", () => switchView(item.dataset.viewTarget));
   });
-  document.getElementById("runPollButton").addEventListener("click", runPoll);
-  document.getElementById("runDiscoveryButton").addEventListener("click", runDiscovery);
-  document.getElementById("presentationRunPoll").addEventListener("click", runPoll);
-  document.getElementById("showcaseZoomIn").addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() + 0.14));
-  document.getElementById("showcaseZoomOut").addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() - 0.14));
-  document.getElementById("devicePrevButton").addEventListener("click", () => setSelectedDeviceIndex(appState.selectedDeviceIndex - 1));
-  document.getElementById("deviceNextButton").addEventListener("click", () => setSelectedDeviceIndex(appState.selectedDeviceIndex + 1));
-  document.getElementById("presentationSetupButton").addEventListener("click", () => setLiveSetupOpen(true));
-  document.getElementById("presentationClearAllButton").addEventListener("click", () => clearLiveInventory());
-  document.getElementById("liveSetupClose").addEventListener("click", () => setLiveSetupOpen(false));
-  document.getElementById("liveSetupBackdrop").addEventListener("click", () => setLiveSetupOpen(false));
-  document.getElementById("presentationClearLiveButton").addEventListener("click", () => clearLiveInventory("presentationSeedResult"));
-  document.getElementById("presentationSeedForm").addEventListener("submit", submitPresentationSeed);
-  document.getElementById("presentationSeedVersion").addEventListener("change", syncSeedVersionFields);
-  document.getElementById("presentationBackendPollToggle").addEventListener("change", async () => {
+  document.getElementById("runPollButton")?.addEventListener("click", toggleBackendPoll);
+  document.getElementById("runDiscoveryButton")?.addEventListener("click", runDiscovery);
+  document.getElementById("presentationRunPoll")?.addEventListener("click", toggleBackendPoll);
+  document.getElementById("showcaseZoomIn")?.addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() + 0.14));
+  document.getElementById("showcaseZoomOut")?.addEventListener("click", () => setShowcaseZoom(getAppliedShowcaseZoom() - 0.14));
+  document.getElementById("devicePrevButton")?.addEventListener("click", () => setSelectedDeviceIndex(appState.selectedDeviceIndex - 1));
+  document.getElementById("deviceNextButton")?.addEventListener("click", () => setSelectedDeviceIndex(appState.selectedDeviceIndex + 1));
+  document.querySelectorAll("[data-monitor-view]").forEach((button) => {
+    button.addEventListener("click", () => setMonitorViewMode(button.dataset.monitorView));
+  });
+  document.getElementById("historyBackButton")?.addEventListener("click", () => setHistoryOverlayOpen(false));
+  document.getElementById("presentationSetupButton")?.addEventListener("click", () => setLiveSetupOpen(true));
+  document.getElementById("presentationClearAllButton")?.addEventListener("click", () => clearLiveInventory());
+  document.getElementById("liveSetupClose")?.addEventListener("click", () => setLiveSetupOpen(false));
+  document.getElementById("liveSetupBackdrop")?.addEventListener("click", () => setLiveSetupOpen(false));
+  document.getElementById("presentationClearLiveButton")?.addEventListener("click", () => clearLiveInventory("presentationSeedResult"));
+  document.getElementById("presentationSeedForm")?.addEventListener("submit", submitPresentationSeed);
+  document.getElementById("presentationSeedVersion")?.addEventListener("change", syncSeedVersionFields);
+  document.getElementById("presentationBackendPollToggle")?.addEventListener("change", async () => {
     await setBackendPolling(
       document.getElementById("presentationBackendPollToggle").checked,
       Number(document.getElementById("presentationPollInterval").value || 30)
     );
   });
-  document.getElementById("presentationPollInterval").addEventListener("change", async () => {
+  document.getElementById("presentationPollInterval")?.addEventListener("change", async () => {
     if (document.getElementById("presentationBackendPollToggle").checked) {
       await setBackendPolling(true, Number(document.getElementById("presentationPollInterval").value || 30));
     }
   });
-  document.getElementById("clearLiveButton").addEventListener("click", () => clearLiveInventory("seedResult"));
-  document.getElementById("seedForm").addEventListener("submit", submitSeed);
-  document.getElementById("seedVersion").addEventListener("change", syncSeedVersionFields);
-  document.getElementById("autoPollToggle").addEventListener("change", async () => {
+  document.getElementById("clearLiveButton")?.addEventListener("click", () => clearLiveInventory("seedResult"));
+  document.getElementById("seedForm")?.addEventListener("submit", submitSeed);
+  document.getElementById("seedVersion")?.addEventListener("change", syncSeedVersionFields);
+  document.getElementById("autoPollToggle")?.addEventListener("change", async () => {
     await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
   });
   window.addEventListener("resize", () => {
@@ -2563,7 +3086,17 @@ function bindEvents() {
   window.addEventListener("wheel", maybeHoldPresentationWheel, { passive: false });
   window.addEventListener("hashchange", () => {
     const view = window.location.hash.replace("#", "");
-    switchView(viewMeta[view] ? view : "home");
+    if (view === "history") {
+      switchView("history", "auto");
+    } else {
+      setHistoryOverlayOpen(false, false);
+      switchView(viewMeta[view] ? view : "home");
+    }
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && appState.historyOverlayOpen) {
+      setHistoryOverlayOpen(false);
+    }
   });
 }
 
@@ -2571,7 +3104,8 @@ function connectEvents() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${window.location.host}/ws/events`);
   socket.addEventListener("open", () => {
-    document.getElementById("eventStreamState").textContent = "WebSocket connected";
+    const streamState = document.getElementById("eventStreamState");
+    if (streamState) streamState.textContent = "WebSocket connected";
     renderKpis();
     renderPresentationDashboard();
   });
@@ -2579,7 +3113,8 @@ function connectEvents() {
     await loadSnapshot();
   });
   socket.addEventListener("close", () => {
-    document.getElementById("eventStreamState").textContent = "WebSocket closed";
+    const streamState = document.getElementById("eventStreamState");
+    if (streamState) streamState.textContent = "WebSocket closed";
     renderKpis();
     renderPresentationDashboard();
   });
@@ -2592,12 +3127,16 @@ updatePresentationProgress();
 loadSnapshot().then(() => {
   connectEvents();
   const view = window.location.hash.replace("#", "");
-  if (viewMeta[view]) {
+  if (view === "history") {
+    switchView("history", "auto");
+  } else if (viewMeta[view]) {
     switchView(view, "auto");
   } else {
     enterPresentationMode("home", "auto");
   }
 }).catch((error) => {
-  document.getElementById("backendState").textContent = "Backend unavailable";
-  document.getElementById("eventStreamState").textContent = error.message;
+  const backendState = document.getElementById("backendState");
+  const streamState = document.getElementById("eventStreamState");
+  if (backendState) backendState.textContent = "Backend unavailable";
+  if (streamState) streamState.textContent = error.message;
 });

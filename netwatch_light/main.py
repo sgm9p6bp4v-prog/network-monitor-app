@@ -53,6 +53,18 @@ class TopologyLayoutPoint(BaseModel):
 class TopologyLayoutRequest(BaseModel):
     layouts: dict[str, TopologyLayoutPoint]
 
+
+class MacLabelRequest(BaseModel):
+    mac: str = Field(min_length=1, max_length=64)
+    name: str = Field(default="", max_length=160)
+    description: str = Field(default="", max_length=400)
+
+
+class DeviceLabelRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(default="", max_length=160)
+    description: str = Field(default="", max_length=400)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -151,7 +163,7 @@ async def poll_live_seeds(source: str) -> dict[str, Any]:
     async with poll_lock:
         for key, config in list(seed_configs.items()):
             try:
-                discovery = await discover_seed(config)
+                discovery = await discover_seed(config, labeled_macs=set(state.mac_labels))
             except Exception as exc:
                 failures += 1
                 last_result = state.mark_live_poll_failed(str(exc), key)
@@ -230,6 +242,15 @@ async def snapshot(response: Response) -> dict[str, Any]:
     return data
 
 
+@app.get("/api/devices/{device_id}/history")
+async def device_history(device_id: str, response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    result = state.get_device_history(device_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return result
+
+
 @app.post("/api/poll")
 async def run_poll() -> dict[str, Any]:
     if state.mode == "live":
@@ -268,6 +289,26 @@ async def save_topology_layout(payload: TopologyLayoutRequest) -> dict[str, Any]
     return result
 
 
+@app.post("/api/mac-labels")
+async def save_mac_label(payload: MacLabelRequest) -> dict[str, Any]:
+    try:
+        result = state.update_mac_label(payload.mac, payload.name, payload.description)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await publish({"type": "mac.label.saved", "event": result["event"]})
+    return result
+
+
+@app.post("/api/device-labels")
+async def save_device_label(payload: DeviceLabelRequest) -> dict[str, Any]:
+    try:
+        result = state.update_device_label(payload.device_id, payload.name, payload.description)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await publish({"type": "device.label.saved", "event": result["event"]})
+    return result
+
+
 @app.post("/api/live/clear")
 async def clear_live_inventory() -> dict[str, Any]:
     seed_configs.clear()
@@ -294,7 +335,7 @@ async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
         priv_protocol=seed.priv_protocol,
     )
     try:
-        discovery = await discover_seed(config)
+        discovery = await discover_seed(config, labeled_macs=set(state.mac_labels))
     except Exception as exc:
         event = state.add_event(f"Live seed failed for {seed.host}: {exc}")
         await publish({"type": "live.seed.failed", "event": event})
