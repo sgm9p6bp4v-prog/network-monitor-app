@@ -1,17 +1,39 @@
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import re
 import time
 from typing import Any
 from uuid import uuid4
 
+from .metrics import (
+    build_interface_metric_samples,
+    load_metric_catalog,
+    metric_catalog_names,
+    metric_catalog_summary,
+)
+from .security import security_settings
+from .storage import DatabaseStore
+
 SNAPSHOT_VERSION = 2
 EVENT_CAP = 20
+POLL_RUN_CAP = 100
 INTERFACE_HISTORY_SECONDS = 60 * 60
 INTERFACE_HISTORY_CAP = 720
+OBSERVED_MAC_LINK_MISSING_POLL_CAP = 3
+TOPOLOGY_CONFIDENCE_MAX = 100
+TOPOLOGY_CONFIDENCE_LABELS = (
+    (90, "authoritative"),
+    (75, "high"),
+    (55, "medium"),
+    (30, "low"),
+    (0, "hint"),
+)
 
 
 def now_iso() -> str:
@@ -22,15 +44,29 @@ def now_clock() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-class NetWatchState:
-    """State container for the light app, persisted to a local JSON file."""
+def _nullable_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-    def __init__(self, persistence_path: Path | None = None) -> None:
+
+class NetWatchState:
+    """State container for the light app, persisted through the configured store."""
+
+    def __init__(self, persistence_path: Path | None = None, database_url: str | None = None) -> None:
         self.persistence_path = persistence_path
+        self.store = DatabaseStore(database_url) if database_url else None
+        self.storage_backend = "database" if self.store else "json"
         self.mode = "mock"
         self.live_failures = 0
         self.live_counters: dict[str, dict[str, float | int]] = {}
         self.interface_history: dict[str, list[dict[str, Any]]] = {}
+        self.metric_catalog_details = load_metric_catalog()
+        self.metric_catalog = metric_catalog_names(self.metric_catalog_details)
+        self.poll_runs: list[dict[str, Any]] = []
         self.devices: list[dict[str, Any]] = [
             {
                 "id": "core-01",
@@ -305,22 +341,6 @@ class NetWatchState:
             {"id": str(uuid4()), "time": now_clock(), "text": "LLDP topology loaded: 3 confirmed links, 1 pending link"},
             {"id": str(uuid4()), "time": now_clock(), "text": "Static threshold alert active on edge-01 eth1/24"},
         ]
-        self.metric_catalog = [
-            "interface.admin_status",
-            "interface.oper_status",
-            "interface.in_octets",
-            "interface.out_octets",
-            "interface.in_bps",
-            "interface.out_bps",
-            "interface.in_errors",
-            "interface.out_errors",
-            "interface.in_discards",
-            "interface.out_discards",
-            "interface.in_error_rate",
-            "interface.out_error_rate",
-            "interface.in_discard_rate",
-            "interface.out_discard_rate",
-        ]
         self.settings = {
             "polling": {
                 "status_seconds": 30,
@@ -332,17 +352,14 @@ class NetWatchState:
                 "backend_auto_poll": False,
                 "backend_interval_seconds": 30,
                 "backend_status": "stopped",
+                "external_poller_status": "unknown",
             },
             "thresholds": {
                 "interface_error_counter": 1,
                 "interface_discard_counter": 1,
             },
-            "security": {
-                "credential_storage": "local JSON state file in light build",
-                "master_key": "not configured",
-                "credential_dek": "not implemented; plaintext local file",
-                "write_session": "not implemented",
-            },
+            "metrics": metric_catalog_summary(self.metric_catalog_details),
+            "security": security_settings(self.store.credential_cipher if self.store else None),
         }
         self.seeds: list[dict[str, Any]] = []
         self.seed_credentials: list[dict[str, Any]] = []
@@ -360,6 +377,8 @@ class NetWatchState:
             "alerts": self.alerts,
             "events": self.events[:EVENT_CAP],
             "metric_catalog": self.metric_catalog,
+            "metric_catalog_details": self.metric_catalog_details,
+            "poll_runs": self.poll_runs[:POLL_RUN_CAP],
             "settings": self.settings,
             "seeds": self.seeds,
             "seed_credentials": self.seed_credentials,
@@ -369,12 +388,23 @@ class NetWatchState:
         }
 
     def _load(self) -> None:
-        if self.persistence_path is None or not self.persistence_path.exists():
-            return
-        try:
-            data = json.loads(self.persistence_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
+        data: dict[str, Any] | None = None
+        loaded_from = ""
+        if self.store:
+            data = self.store.load_payload()
+            if data is not None:
+                loaded_from = "database"
+        if data is None:
+            if self.persistence_path is None or not self.persistence_path.exists():
+                return
+            try:
+                loaded = json.loads(self.persistence_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return
+            if not isinstance(loaded, dict):
+                return
+            data = loaded
+            loaded_from = "json"
         if not isinstance(data, dict):
             return
         self.mode = data.get("mode", self.mode)
@@ -383,7 +413,13 @@ class NetWatchState:
         self.links = data.get("links", self.links)
         self.alerts = data.get("alerts", self.alerts)
         self.events = data.get("events", self.events)[:EVENT_CAP]
-        self.metric_catalog = data.get("metric_catalog", self.metric_catalog)
+        self.metric_catalog_details = load_metric_catalog()
+        self.metric_catalog = metric_catalog_names(self.metric_catalog_details)
+        self.poll_runs = [
+            run
+            for run in data.get("poll_runs", self.poll_runs)
+            if isinstance(run, dict) and run.get("id")
+        ][:POLL_RUN_CAP]
         loaded_settings = data.get("settings", {})
         if isinstance(loaded_settings, dict):
             self.settings.update(loaded_settings)
@@ -391,15 +427,12 @@ class NetWatchState:
             self.settings["polling"].setdefault("backend_auto_poll", False)
             self.settings["polling"].setdefault("backend_interval_seconds", 30)
             self.settings["polling"].setdefault("backend_status", "stopped")
+            self.settings["polling"].setdefault("external_poller_status", "unknown")
             self.settings.setdefault("thresholds", {})
             self.settings["thresholds"].setdefault("interface_error_counter", 1)
             self.settings["thresholds"].setdefault("interface_discard_counter", 1)
-            self.settings["security"] = {
-                "credential_storage": "local JSON state file in light build",
-                "master_key": "not configured",
-                "credential_dek": "not implemented; plaintext local file",
-                "write_session": "not implemented",
-            }
+            self.settings["metrics"] = metric_catalog_summary(self.metric_catalog_details)
+            self.settings["security"] = security_settings(self.store.credential_cipher if self.store else None)
         self.seeds = data.get("seeds", self.seeds)
         self.seed_credentials = data.get("seed_credentials", self.seed_credentials)
         loaded_history = data.get("interface_history", {})
@@ -421,8 +454,22 @@ class NetWatchState:
                 if (key := self._device_label_key(raw_key)) and isinstance(label, dict)
             }
             self._apply_device_labels()
+        changed = self._deduplicate_observed_topology()
+        changed = self._annotate_topology_links() or changed
+        if changed:
+            self._propagate_endpoint_port_traffic()
+            self._sync_alerts_from_devices()
+            self.persist()
+        elif self.store and loaded_from == "json":
+            self.persist()
+
+    def reload(self) -> None:
+        self._load()
 
     def persist(self) -> None:
+        if self.store:
+            self.store.save_payload(self._payload())
+            return
         if self.persistence_path is None:
             return
         self.persistence_path.parent.mkdir(parents=True, exist_ok=True)
@@ -438,11 +485,183 @@ class NetWatchState:
             "alerts": deepcopy(self.alerts),
             "events": deepcopy(self.events),
             "metric_catalog": deepcopy(self.metric_catalog),
+            "metric_catalog_details": deepcopy(self.metric_catalog_details),
+            "poll_runs": deepcopy(self.poll_runs),
             "settings": deepcopy(self.settings),
             "seeds": deepcopy(self.seeds),
             "mac_labels": deepcopy(self.mac_labels),
             "device_labels": deepcopy(self.device_labels),
+            "operational_summary": self.operational_summary(),
+            "storage": {"backend": self.storage_backend},
         }
+
+    def operational_summary(self) -> dict[str, Any]:
+        polling = self.settings.setdefault("polling", {})
+        poll_interval = self._poll_interval_seconds()
+        last_run = deepcopy(self.poll_runs[0]) if self.poll_runs else None
+        last_seen_ts = _nullable_float(polling.get("external_poller_last_seen_ts"))
+        poller_age = round(time.time() - last_seen_ts) if last_seen_ts else None
+        poller_alive = self.is_external_poller_alive(max_age_seconds=max(45, poll_interval * 2))
+        last_status = str(last_run.get("status") if last_run else polling.get("last_poll_run_status") or "unknown")
+        poll_health_status = "ok" if poller_alive and last_status in {"succeeded", "running", "unknown"} else "warning"
+        if not poller_alive or last_status == "failed":
+            poll_health_status = "down"
+        elif last_status == "partial":
+            poll_health_status = "warning"
+
+        latest_data = self._latest_data_summary(poll_interval)
+        topology = self._topology_evidence_summary()
+        problems = self._operational_problems(poller_alive, last_run, latest_data, topology)
+        return {
+            "poll_health": {
+                "status": poll_health_status,
+                "poller_alive": poller_alive,
+                "poller_status": polling.get("external_poller_status") or "unknown",
+                "poller_age_seconds": poller_age,
+                "auto_poll": bool(polling.get("backend_auto_poll")),
+                "interval_seconds": poll_interval,
+                "last_run": last_run,
+            },
+            "topology_evidence": topology,
+            "latest_data": latest_data,
+            "problems": problems,
+        }
+
+    def _poll_interval_seconds(self) -> int:
+        polling = self.settings.setdefault("polling", {})
+        try:
+            return max(5, min(3600, int(polling.get("backend_interval_seconds") or 30)))
+        except (TypeError, ValueError):
+            return 30
+
+    def _latest_data_summary(self, poll_interval: int) -> dict[str, Any]:
+        now = time.time()
+        latest_ts = 0.0
+        sample_count = 0
+        interfaces_total = 0
+        interfaces_with_samples = 0
+        interfaces_with_traffic = 0
+        stale_threshold = max(120, poll_interval * 3)
+        stale_interfaces = 0
+        for device in self.devices:
+            for interface in device.get("interfaces", []):
+                interfaces_total += 1
+                key = self._interface_history_key(str(device.get("id") or ""), str(interface.get("id") or ""))
+                samples = self.interface_history.get(key) or []
+                if not samples:
+                    continue
+                interfaces_with_samples += 1
+                sample_count += len(samples)
+                latest = max((_nullable_float(sample.get("ts")) or 0 for sample in samples), default=0)
+                latest_ts = max(latest_ts, latest)
+                if now - latest > stale_threshold:
+                    stale_interfaces += 1
+                if interface.get("in_bps") is not None or interface.get("out_bps") is not None:
+                    interfaces_with_traffic += 1
+        newest_age = round(now - latest_ts) if latest_ts else None
+        if latest_ts <= 0:
+            status = "unknown"
+        elif newest_age is not None and newest_age <= stale_threshold:
+            status = "fresh"
+        else:
+            status = "stale"
+        return {
+            "status": status,
+            "sample_count": sample_count,
+            "latest_sample_ts": latest_ts or None,
+            "latest_sample_age_seconds": newest_age,
+            "stale_threshold_seconds": stale_threshold,
+            "interfaces_total": interfaces_total,
+            "interfaces_with_samples": interfaces_with_samples,
+            "interfaces_with_traffic": interfaces_with_traffic,
+            "stale_interfaces": stale_interfaces,
+        }
+
+    def _topology_evidence_summary(self) -> dict[str, Any]:
+        confidence = Counter(str(link.get("confidence_label") or "unknown") for link in self.links)
+        directness = Counter(str(link.get("directness") or "unknown") for link in self.links)
+        sources: Counter[str] = Counter()
+        low_confidence_links = []
+        for link in self.links:
+            for source in link.get("evidence_sources", []) or []:
+                if isinstance(source, dict):
+                    sources[str(source.get("source") or "unknown")] += 1
+            if int(link.get("confidence") or 0) < 55:
+                low_confidence_links.append(link)
+        authoritative = confidence.get("authoritative", 0) + confidence.get("high", 0)
+        total = len(self.links)
+        score = round((authoritative / total) * 100) if total else 0
+        return {
+            "status": "strong" if score >= 70 else "mixed" if total else "empty",
+            "score": score,
+            "total_links": total,
+            "confirmed_links": sum(1 for link in self.links if link.get("status") == "confirmed"),
+            "pending_links": sum(1 for link in self.links if link.get("status") == "pending"),
+            "low_confidence_links": len(low_confidence_links),
+            "confidence": dict(confidence),
+            "directness": dict(directness),
+            "sources": dict(sources),
+        }
+
+    def _operational_problems(
+        self,
+        poller_alive: bool,
+        last_run: dict[str, Any] | None,
+        latest_data: dict[str, Any],
+        topology: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        problems: list[dict[str, Any]] = []
+        active_alerts = [alert for alert in self.alerts if alert.get("state") == "active"]
+        if active_alerts:
+            problems.append(
+                {
+                    "severity": "critical",
+                    "title": f"{len(active_alerts)} active alert(s)",
+                    "detail": str(active_alerts[0].get("title") or "Alert queue needs attention"),
+                }
+            )
+        failed_seeds = [seed for seed in self.seeds if seed.get("status") not in {"up", "unknown"} or seed.get("last_error")]
+        if failed_seeds:
+            problems.append(
+                {
+                    "severity": "warning",
+                    "title": f"{len(failed_seeds)} seed issue(s)",
+                    "detail": str(failed_seeds[0].get("last_error") or failed_seeds[0].get("host") or "Seed status changed"),
+                }
+            )
+        if not poller_alive and self.mode == "live":
+            problems.append(
+                {
+                    "severity": "critical",
+                    "title": "Poller offline",
+                    "detail": "The external poller heartbeat is stale or missing.",
+                }
+            )
+        if last_run and last_run.get("status") in {"failed", "partial"}:
+            problems.append(
+                {
+                    "severity": "critical" if last_run.get("status") == "failed" else "warning",
+                    "title": f"Last poll {last_run.get('status')}",
+                    "detail": f"{last_run.get('successes', 0)} ok / {last_run.get('failures', 0)} failed",
+                }
+            )
+        if latest_data.get("status") == "stale":
+            problems.append(
+                {
+                    "severity": "warning",
+                    "title": "Stale interface data",
+                    "detail": f"{latest_data.get('stale_interfaces', 0)} interface(s) exceed freshness threshold.",
+                }
+            )
+        if topology.get("low_confidence_links"):
+            problems.append(
+                {
+                    "severity": "info",
+                    "title": f"{topology['low_confidence_links']} low-confidence link(s)",
+                    "detail": "Some topology edges are inferred from weak evidence.",
+                }
+            )
+        return problems[:8]
 
     def get_device_history(self, device_id: str) -> dict[str, Any] | None:
         device = self._device(device_id)
@@ -606,11 +825,138 @@ class NetWatchState:
         polling = self.settings.setdefault("polling", {})
         polling["backend_auto_poll"] = enabled
         polling["backend_interval_seconds"] = interval_seconds
-        polling["backend_status"] = "running" if enabled else "stopped"
+        polling["backend_status"] = "enabled" if enabled else "stopped"
         event = self.add_event(
             f"Backend auto poll {'enabled' if enabled else 'disabled'}: {interval_seconds}s interval"
         )
         return {"event": event, "snapshot": self.snapshot()}
+
+    def start_poll_run(self, source: str, seed_count: int = 0) -> str:
+        run_id = str(uuid4())
+        started_ts = time.time()
+        run = {
+            "id": run_id,
+            "source": str(source or "poll"),
+            "status": "running",
+            "started_at": now_iso(),
+            "started_at_ts": started_ts,
+            "finished_at": "",
+            "duration_ms": None,
+            "seed_count": max(0, int(seed_count or 0)),
+            "successes": 0,
+            "failures": 0,
+            "error": "",
+        }
+        self.poll_runs.insert(0, run)
+        self.poll_runs = self.poll_runs[:POLL_RUN_CAP]
+        polling = self.settings.setdefault("polling", {})
+        polling["current_poll_run_id"] = run_id
+        polling["last_poll_run_id"] = run_id
+        polling["backend_status"] = "polling"
+        self.persist()
+        return run_id
+
+    def finish_poll_run(
+        self,
+        run_id: str,
+        status: str,
+        successes: int = 0,
+        failures: int = 0,
+        error: str = "",
+    ) -> None:
+        if not run_id:
+            return
+        run = next((item for item in self.poll_runs if item.get("id") == run_id), None)
+        if run is None:
+            run = {
+                "id": run_id,
+                "source": "poll",
+                "started_at": "",
+                "started_at_ts": time.time(),
+                "seed_count": int(successes or 0) + int(failures or 0),
+            }
+            self.poll_runs.insert(0, run)
+        finished_ts = time.time()
+        try:
+            started_ts = float(run.get("started_at_ts") or finished_ts)
+        except (TypeError, ValueError):
+            started_ts = finished_ts
+        duration_ms = round(max(0.0, finished_ts - started_ts) * 1000)
+        run.update(
+            {
+                "status": str(status or "unknown"),
+                "finished_at": now_iso(),
+                "duration_ms": duration_ms,
+                "successes": max(0, int(successes or 0)),
+                "failures": max(0, int(failures or 0)),
+                "error": str(error or ""),
+            }
+        )
+        self.poll_runs = self.poll_runs[:POLL_RUN_CAP]
+        polling = self.settings.setdefault("polling", {})
+        polling["current_poll_run_id"] = ""
+        polling["last_poll_run_id"] = run_id
+        polling["last_poll_run_status"] = run["status"]
+        polling["last_poll_run_finished_at"] = run["finished_at"]
+        polling["last_poll_duration_ms"] = duration_ms
+        self.persist()
+
+    def request_manual_poll(self, source: str = "manual poll") -> dict[str, Any]:
+        polling = self.settings.setdefault("polling", {})
+        request_id = str(uuid4())
+        polling["manual_poll_request_id"] = request_id
+        polling["manual_poll_requested_at"] = now_iso()
+        polling["manual_poll_source"] = source
+        polling["backend_status"] = "queued"
+        event = self.add_event(f"Poll request queued for external poller: {source}")
+        return {"event": event, "snapshot": self.snapshot(), "queued": True, "request_id": request_id}
+
+    def pending_manual_poll_request(self) -> dict[str, str] | None:
+        polling = self.settings.setdefault("polling", {})
+        request_id = str(polling.get("manual_poll_request_id") or "")
+        if not request_id:
+            return None
+        if request_id == str(polling.get("manual_poll_completed_id") or ""):
+            return None
+        return {
+            "id": request_id,
+            "source": str(polling.get("manual_poll_source") or "manual poll"),
+            "requested_at": str(polling.get("manual_poll_requested_at") or ""),
+        }
+
+    def complete_manual_poll_request(self, request_id: str, result: dict[str, Any] | None = None) -> None:
+        polling = self.settings.setdefault("polling", {})
+        if request_id:
+            polling["manual_poll_completed_id"] = request_id
+            polling["manual_poll_completed_at"] = now_iso()
+        if result:
+            polling["last_manual_poll_successes"] = result.get("successes")
+            polling["last_manual_poll_failures"] = result.get("failures")
+        polling["backend_status"] = "running" if polling.get("backend_auto_poll") else "idle"
+        self.persist()
+
+    def update_external_poller_status(self, status: str, pid: int | None = None) -> None:
+        polling = self.settings.setdefault("polling", {})
+        polling["external_poller_status"] = status
+        polling["external_poller_last_seen"] = now_iso()
+        polling["external_poller_last_seen_ts"] = time.time()
+        polling["external_poller_pid"] = pid if pid is not None else os.getpid()
+        if status == "polling":
+            polling["backend_status"] = "polling"
+        elif status == "running":
+            polling["backend_status"] = "running" if polling.get("backend_auto_poll") else "idle"
+        elif status == "stopped":
+            polling["backend_status"] = "stopped"
+        self.persist()
+
+    def is_external_poller_alive(self, max_age_seconds: int = 45) -> bool:
+        polling = self.settings.setdefault("polling", {})
+        last_seen = polling.get("external_poller_last_seen_ts")
+        try:
+            age = time.time() - float(last_seen)
+        except (TypeError, ValueError):
+            return False
+        return age <= max_age_seconds and str(polling.get("external_poller_status") or "") in {"running", "polling"}
 
     def register_live_seed(self, seed_metadata: dict[str, Any]) -> None:
         key = seed_metadata["key"]
@@ -683,7 +1029,11 @@ class NetWatchState:
             candidate["last_seen"] = now_iso()
             self._apply_device_label_to_device(candidate)
             self._apply_mac_label_to_device(candidate)
-            infrastructure_match_ids = self._segment_known_infrastructure_ids(candidate, devices_by_id)
+            infrastructure_match_ids = (
+                set()
+                if candidate.get("device_type") == "segment"
+                else self._segment_known_infrastructure_ids(candidate, devices_by_id)
+            )
             if len(infrastructure_match_ids) == 1:
                 candidate_remap[candidate["id"]] = next(iter(infrastructure_match_ids))
                 continue
@@ -702,10 +1052,12 @@ class NetWatchState:
             if link.get("from") not in skipped_candidate_ids and link.get("to") not in skipped_candidate_ids
         ]
         self._merge_live_links(live_links, candidate_remap, seed_key)
+        self._deduplicate_observed_topology()
         self._prune_unlinked_observed_endpoints(seed_key)
         self._propagate_endpoint_port_traffic()
         self._record_interface_history(self.devices)
         self._sync_alerts_from_devices()
+        self._annotate_topology_links()
         counts = discovery["counts"]
         event = self.add_event(
             "Live seed imported: "
@@ -843,11 +1195,20 @@ class NetWatchState:
                 key = self._interface_history_key(device_id, interface_id)
                 active_keys.add(key)
                 samples = self.interface_history.setdefault(key, [])
+                metric_samples = build_interface_metric_samples(
+                    self.metric_catalog_details,
+                    device,
+                    interface,
+                    now,
+                )
+                traffic_missing = interface.get("in_bps") is None and interface.get("out_bps") is None
                 samples.append(
                     {
                         "ts": now,
                         "in_bps": interface.get("in_bps"),
                         "out_bps": interface.get("out_bps"),
+                        "quality": "missing" if traffic_missing else "ok",
+                        "metrics": metric_samples,
                     }
                 )
                 self.interface_history[key] = [
@@ -934,6 +1295,680 @@ class NetWatchState:
             )
         ]
 
+    def _annotate_topology_links(self) -> bool:
+        changed = False
+        for link in self.links:
+            changed = self._annotate_topology_link(link) or changed
+        return changed
+
+    def _annotate_topology_link(self, link: dict[str, Any]) -> bool:
+        before = {
+            "evidence_sources": deepcopy(link.get("evidence_sources")),
+            "confidence": link.get("confidence"),
+            "confidence_label": link.get("confidence_label"),
+            "directness": link.get("directness"),
+            "line_style": link.get("line_style"),
+            "topology_decision": link.get("topology_decision"),
+        }
+        sources = self._link_evidence_sources(link)
+        confidence = self._link_confidence(link, sources)
+        link["evidence_sources"] = sources
+        link["confidence"] = confidence
+        link["confidence_label"] = self._confidence_label(confidence)
+        link["directness"] = self._link_directness(link, sources, confidence)
+        link["line_style"] = "solid" if confidence >= 75 else "dashed"
+        link.setdefault("topology_decision", self._default_topology_decision(link))
+        after = {
+            "evidence_sources": link.get("evidence_sources"),
+            "confidence": link.get("confidence"),
+            "confidence_label": link.get("confidence_label"),
+            "directness": link.get("directness"),
+            "line_style": link.get("line_style"),
+            "topology_decision": link.get("topology_decision"),
+        }
+        return before != after
+
+    def _link_evidence_sources(self, link: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_sources = link.get("evidence_sources")
+        if isinstance(raw_sources, list) and raw_sources:
+            sources = [
+                self._normalize_evidence_source(source, link)
+                for source in raw_sources
+                if isinstance(source, dict)
+            ]
+            if sources:
+                return sources
+
+        text = str(link.get("evidence") or "").strip()
+        lowered = text.lower()
+        observed_at = str(link.get("last_seen") or now_iso())
+        if "lldp both sides" in lowered:
+            return [
+                {
+                    "source": "lldp",
+                    "direction": "both",
+                    "weight": 100,
+                    "detail": "LLDP observed from both devices",
+                    "observed_at": observed_at,
+                }
+            ]
+        if "lldp one side + snmp seed match" in lowered:
+            return [
+                {
+                    "source": "lldp",
+                    "direction": "one",
+                    "weight": 85,
+                    "detail": "LLDP one side matched to imported SNMP seed",
+                    "observed_at": observed_at,
+                }
+            ]
+        if lowered.startswith("lldp") or "lldp" in lowered:
+            return [
+                {
+                    "source": "lldp",
+                    "direction": "one",
+                    "weight": 68,
+                    "detail": text or "LLDP one side from seed",
+                    "observed_at": observed_at,
+                }
+            ]
+        if "q-bridge" in lowered:
+            return [
+                {
+                    "source": "fdb",
+                    "direction": "observed",
+                    "weight": 52,
+                    "detail": text or "MAC table Q-BRIDGE-MIB",
+                    "observed_at": observed_at,
+                }
+            ]
+        if "bridge-mib" in lowered or "mac table" in lowered:
+            return [
+                {
+                    "source": "fdb",
+                    "direction": "observed",
+                    "weight": 44,
+                    "detail": text or "MAC table BRIDGE-MIB",
+                    "observed_at": observed_at,
+                }
+            ]
+        if "shared mac segment" in lowered or "shared" in lowered:
+            return [
+                {
+                    "source": "fdb-segment",
+                    "direction": "observed",
+                    "weight": 35,
+                    "detail": text or "Shared MAC segment",
+                    "observed_at": observed_at,
+                }
+            ]
+        if "port description" in lowered:
+            return [
+                {
+                    "source": "port-description",
+                    "direction": "described",
+                    "weight": 25,
+                    "detail": text or "Port description",
+                    "observed_at": observed_at,
+                }
+            ]
+        return [
+            {
+                "source": "unknown",
+                "direction": "unknown",
+                "weight": 15,
+                "detail": text or "No structured evidence",
+                "observed_at": observed_at,
+            }
+        ]
+
+    def _normalize_evidence_source(self, source: dict[str, Any], link: dict[str, Any]) -> dict[str, Any]:
+        try:
+            weight = int(source.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0
+        return {
+            "source": str(source.get("source") or "unknown"),
+            "direction": str(source.get("direction") or ""),
+            "weight": max(0, min(TOPOLOGY_CONFIDENCE_MAX, weight)),
+            "detail": str(source.get("detail") or link.get("evidence") or ""),
+            "observed_at": str(source.get("observed_at") or link.get("last_seen") or now_iso()),
+        }
+
+    def _link_confidence(self, link: dict[str, Any], sources: list[dict[str, Any]] | None = None) -> int:
+        evidence_sources = sources or self._link_evidence_sources(link)
+        score = max((int(source.get("weight") or 0) for source in evidence_sources), default=0)
+        if link.get("status") == "confirmed":
+            score = max(score, 80)
+        if link.get("status") == "pending":
+            score = min(score, 68)
+        missing_polls = int(link.get("missing_polls") or 0)
+        if missing_polls:
+            score -= min(45, missing_polls * 15)
+        if link.get("stale"):
+            score -= 15
+        return max(0, min(TOPOLOGY_CONFIDENCE_MAX, score))
+
+    def _confidence_label(self, confidence: int) -> str:
+        for minimum, label in TOPOLOGY_CONFIDENCE_LABELS:
+            if confidence >= minimum:
+                return label
+        return "unknown"
+
+    def _link_directness(self, link: dict[str, Any], sources: list[dict[str, Any]], confidence: int) -> str:
+        source_names = {str(source.get("source") or "") for source in sources}
+        directions = {str(source.get("direction") or "") for source in sources}
+        if "lldp" in source_names and "both" in directions:
+            return "direct"
+        if "lldp" in source_names and confidence >= 80:
+            return "probable-direct"
+        if "lldp" in source_names:
+            return "candidate"
+        if "fdb" in source_names:
+            return "observed-fdb"
+        if "fdb-segment" in source_names:
+            return "shared-segment"
+        if "port-description" in source_names:
+            return "described-port"
+        return "unknown"
+
+    def _default_topology_decision(self, link: dict[str, Any]) -> str:
+        confidence = int(link.get("confidence") or 0)
+        directness = str(link.get("directness") or "unknown")
+        if directness == "direct":
+            return "Displayed as direct link: LLDP evidence is authoritative."
+        if directness == "probable-direct":
+            return "Displayed as probable direct link: one-sided LLDP matched an imported SNMP seed."
+        if directness == "candidate":
+            return "Displayed as candidate link: one-sided LLDP has no reciprocal confirmation yet."
+        if directness == "observed-fdb":
+            return f"Displayed as observed link: MAC table evidence with {confidence}% confidence."
+        if directness == "shared-segment":
+            return "Displayed as shared segment: multiple MAC addresses were learned on one switch port."
+        if directness == "described-port":
+            return "Displayed as descriptive hint: port description exists but no stronger L2 evidence was found."
+        return "Displayed with unknown evidence quality."
+
+    def _deduplicate_observed_topology(self) -> bool:
+        changed = self._clear_seen_observed_link_stale_flags()
+        changed = self._deduplicate_resolved_pending_devices() or changed
+        devices_by_id = {device.get("id"): device for device in self.devices if device.get("id")}
+        interface_index = self._interface_index_by_id(devices_by_id)
+        infrastructure_interfaces, infrastructure_ports = self._infrastructure_link_ports(devices_by_id, interface_index)
+        changed = self._prune_infrastructure_port_observations(
+            devices_by_id,
+            interface_index,
+            infrastructure_interfaces,
+            infrastructure_ports,
+        ) or changed
+        changed = self._keep_best_observed_mac_links(
+            devices_by_id,
+            interface_index,
+            infrastructure_interfaces,
+            infrastructure_ports,
+        ) or changed
+        if changed:
+            linked_ids = {link.get("from") for link in self.links} | {link.get("to") for link in self.links}
+            self.devices = [
+                device
+                for device in self.devices
+                if device.get("device_type") not in {"endpoint", "segment"} or device.get("id") in linked_ids
+            ]
+        return changed
+
+    def _clear_seen_observed_link_stale_flags(self) -> bool:
+        changed = False
+        for link in self.links:
+            if link.get("stale") and int(link.get("missing_polls") or 0) <= 0:
+                link["stale"] = False
+                changed = True
+        return changed
+
+    def _deduplicate_resolved_pending_devices(self) -> bool:
+        devices_by_id = {device.get("id"): device for device in self.devices if device.get("id")}
+        active_infrastructure = [
+            device
+            for device in devices_by_id.values()
+            if device.get("status") != "pending" and self._is_infrastructure_device(device)
+        ]
+        remap: dict[str, str] = {}
+        remap_to_interface: dict[str, str] = {}
+        for candidate in devices_by_id.values():
+            candidate_id = str(candidate.get("id") or "")
+            if not candidate_id:
+                continue
+            if candidate.get("status") == "pending":
+                match_id = self._resolved_pending_match_id(candidate, active_infrastructure)
+            elif candidate.get("status") == "observed" and candidate.get("device_type") == "endpoint":
+                match_id = self._resolved_observed_endpoint_match_id(candidate, active_infrastructure)
+                if match_id:
+                    interface_id = self._matched_infrastructure_interface_id(candidate, devices_by_id.get(match_id))
+                    if interface_id:
+                        remap_to_interface[candidate_id] = interface_id
+            else:
+                continue
+            if match_id and match_id != candidate_id:
+                remap[candidate_id] = match_id
+
+        if not remap:
+            return False
+
+        for old_id, new_id in remap.items():
+            resolved = devices_by_id.get(old_id)
+            active = devices_by_id.get(new_id)
+            if resolved and active and resolved.get("layout") and active.get("layout", {}).get("source") != "manual":
+                active["layout"] = resolved["layout"]
+
+        self.devices = [device for device in self.devices if str(device.get("id") or "") not in remap]
+        merged_links: dict[str, dict[str, Any]] = {}
+        for raw_link in self.links:
+            link = deepcopy(raw_link)
+            old_from = str(link.get("from") or "")
+            old_to = str(link.get("to") or "")
+            link["from"] = remap.get(old_from, link.get("from"))
+            link["to"] = remap.get(old_to, link.get("to"))
+            if old_to in remap_to_interface:
+                link["to_interface"] = remap_to_interface[old_to]
+            if link.get("from") == link.get("to"):
+                continue
+            link["id"] = self._stable_link_id(link)
+            merged_links[link["id"]] = {**merged_links.get(link["id"], {}), **link}
+        self.links = list(merged_links.values())
+        self._confirm_reciprocal_links()
+        return True
+
+    def _resolved_pending_match_id(
+        self, pending: dict[str, Any], active_infrastructure: list[dict[str, Any]]
+    ) -> str | None:
+        pending_ips = {
+            str(value).strip()
+            for value in (pending.get("ip"), pending.get("lldp_mgmt_ip"), pending.get("observed_ip"))
+            if value and str(value).strip() != "unknown"
+        }
+        pending_names = {
+            str(value).strip().lower()
+            for value in (pending.get("name"), pending.get("lldp_sys_name"))
+            if value and not str(value).strip().lower().startswith("lldp neighbor")
+        }
+        pending_identifiers = {
+            self._normalize_identifier(value)
+            for value in (
+                pending.get("fingerprint"),
+                pending.get("chassis_id"),
+                pending.get("mac"),
+                pending.get("observed_mac"),
+            )
+        }
+        pending_identifiers.discard("")
+
+        for device in active_infrastructure:
+            device_ips = {
+                str(value).strip()
+                for value in (device.get("ip"), device.get("lldp_mgmt_ip"), device.get("observed_ip"))
+                if value and str(value).strip() != "unknown"
+            }
+            if pending_ips.intersection(device_ips):
+                return str(device["id"])
+
+            device_names = {
+                str(value).strip().lower()
+                for value in (device.get("name"), device.get("lldp_sys_name"))
+                if value
+            }
+            if pending_names.intersection(device_names):
+                return str(device["id"])
+
+            device_identifiers = {
+                self._normalize_identifier(value)
+                for value in (
+                    device.get("fingerprint"),
+                    device.get("chassis_id"),
+                    device.get("mac"),
+                    device.get("observed_mac"),
+                )
+            }
+            device_identifiers.update(
+                self._normalize_identifier(interface.get("if_phys_address"))
+                for interface in device.get("interfaces", []) or []
+                if interface.get("if_phys_address")
+            )
+            device_identifiers.discard("")
+            if pending_identifiers.intersection(device_identifiers):
+                return str(device["id"])
+
+        return None
+
+    def _resolved_observed_endpoint_match_id(
+        self, endpoint: dict[str, Any], active_infrastructure: list[dict[str, Any]]
+    ) -> str | None:
+        endpoint_ips = {
+            str(value).strip()
+            for value in (endpoint.get("ip"), endpoint.get("observed_ip"))
+            if value and str(value).strip() != "unknown"
+        }
+        endpoint_macs = set(self._device_mac_label_keys(endpoint))
+        observed_macs = {self._mac_label_key(value) for value in endpoint.get("observed_macs", []) or []}
+        observed_macs.discard("")
+        if len(observed_macs) > 1 and not self._mac_label_key(endpoint.get("mac")):
+            endpoint_macs.difference_update(observed_macs)
+
+        if not endpoint_ips and not endpoint_macs:
+            return None
+
+        matches: set[str] = set()
+        for device in active_infrastructure:
+            if device.get("id") == endpoint.get("id"):
+                continue
+            device_ips = {
+                str(value).strip()
+                for value in (device.get("ip"), device.get("lldp_mgmt_ip"), device.get("observed_ip"))
+                if value and str(value).strip() != "unknown"
+            }
+            if endpoint_ips.intersection(device_ips):
+                matches.add(str(device["id"]))
+                continue
+
+            device_macs = self._infrastructure_device_mac_keys(device)
+            if endpoint_macs.intersection(device_macs):
+                matches.add(str(device["id"]))
+
+        if len(matches) == 1:
+            return next(iter(matches))
+        return None
+
+    def _matched_infrastructure_interface_id(
+        self, endpoint: dict[str, Any], device: dict[str, Any] | None
+    ) -> str:
+        if not device:
+            return ""
+        endpoint_macs = set(self._device_mac_label_keys(endpoint))
+        for interface in device.get("interfaces", []) or []:
+            interface_key = self._mac_label_key(interface.get("if_phys_address"))
+            if interface_key and interface_key in endpoint_macs:
+                return str(interface.get("id") or "")
+        return ""
+
+    def _infrastructure_device_mac_keys(self, device: dict[str, Any]) -> set[str]:
+        keys = set(self._device_mac_label_keys(device))
+        for interface in device.get("interfaces", []) or []:
+            key = self._mac_label_key(interface.get("if_phys_address"))
+            if key:
+                keys.add(key)
+        return keys
+
+    def _interface_index_by_id(
+        self, devices_by_id: dict[str, dict[str, Any]]
+    ) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for device in devices_by_id.values():
+            for interface in device.get("interfaces", []) or []:
+                interface_id = interface.get("id")
+                if interface_id:
+                    interface_index[interface_id] = (device, interface)
+        return interface_index
+
+    def _infrastructure_link_ports(
+        self,
+        devices_by_id: dict[str, dict[str, Any]],
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    ) -> tuple[set[str], set[tuple[str, str]]]:
+        interface_ids: set[str] = set()
+        port_names: set[tuple[str, str]] = set()
+        for link in self.links:
+            if link.get("status") == "observed":
+                continue
+            from_device = devices_by_id.get(link.get("from"))
+            to_device = devices_by_id.get(link.get("to"))
+            if not from_device or not to_device:
+                continue
+            if not self._is_infrastructure_device(from_device) or not self._is_infrastructure_device(to_device):
+                continue
+            self._add_infrastructure_link_port(from_device, link.get("from_interface"), link.get("local_port"), interface_ids, port_names, interface_index)
+            self._add_infrastructure_link_port(to_device, link.get("to_interface"), link.get("remote_port"), interface_ids, port_names, interface_index)
+        return interface_ids, port_names
+
+    def _add_infrastructure_link_port(
+        self,
+        device: dict[str, Any],
+        interface_id: Any,
+        port_name: Any,
+        interface_ids: set[str],
+        port_names: set[tuple[str, str]],
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
+        device_id = str(device.get("id") or "")
+        if not device_id:
+            return
+        if interface_id and interface_id in interface_index:
+            interface_ids.add(str(interface_id))
+            _, interface = interface_index[str(interface_id)]
+            for value in (interface.get("name"), interface.get("if_alias"), interface.get("if_descr")):
+                key = self._port_key(value)
+                if key:
+                    port_names.add((device_id, key))
+        for value in (port_name,):
+            key = self._port_key(value)
+            if key:
+                port_names.add((device_id, key))
+
+    def _prune_infrastructure_port_observations(
+        self,
+        devices_by_id: dict[str, dict[str, Any]],
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+        infrastructure_interfaces: set[str],
+        infrastructure_ports: set[tuple[str, str]],
+    ) -> bool:
+        kept_links: list[dict[str, Any]] = []
+        changed = False
+        for link in self.links:
+            target = devices_by_id.get(link.get("to"))
+            if (
+                link.get("status") == "observed"
+                and target
+                and self._is_infrastructure_device(target)
+                and "shared mac segment" in str(link.get("evidence") or "").lower()
+            ):
+                changed = True
+                continue
+            if (
+                link.get("status") == "observed"
+                and target
+                and target.get("device_type") in {"endpoint", "segment"}
+                and self._is_infrastructure_observation(link, interface_index, infrastructure_interfaces, infrastructure_ports)
+            ):
+                changed = True
+                continue
+            kept_links.append(link)
+        if changed:
+            self.links = kept_links
+        return changed
+
+    def _keep_best_observed_mac_links(
+        self,
+        devices_by_id: dict[str, dict[str, Any]],
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+        infrastructure_interfaces: set[str],
+        infrastructure_ports: set[tuple[str, str]],
+    ) -> bool:
+        observed_links_by_mac: dict[str, list[dict[str, Any]]] = {}
+        observed_link_count_by_interface: dict[str, int] = {}
+        for link in self.links:
+            target = devices_by_id.get(link.get("to"))
+            if link.get("status") != "observed" or not target:
+                continue
+            if target.get("device_type") == "endpoint":
+                mac_key = self._observed_link_mac_key(target, link)
+                group_key = f"endpoint:{mac_key}" if mac_key else ""
+            elif self._is_infrastructure_device(target):
+                mac_key = self._observed_infrastructure_link_mac_key(target, link)
+                group_key = f"infrastructure:{target.get('id')}:{mac_key}" if mac_key else ""
+            else:
+                group_key = ""
+            if not group_key:
+                continue
+            observed_links_by_mac.setdefault(group_key, []).append(link)
+            from_interface = str(link.get("from_interface") or "")
+            if from_interface:
+                observed_link_count_by_interface[from_interface] = observed_link_count_by_interface.get(from_interface, 0) + 1
+
+        links_to_remove: set[str] = set()
+        endpoint_updates: dict[str, dict[str, Any]] = {}
+        for links in observed_links_by_mac.values():
+            if len(links) <= 1:
+                continue
+            best = max(
+                links,
+                key=lambda link: self._observed_link_score(
+                    link,
+                    interface_index,
+                    infrastructure_interfaces,
+                    infrastructure_ports,
+                    observed_link_count_by_interface,
+                ),
+            )
+            for link in links:
+                if link is not best:
+                    links_to_remove.add(str(link.get("id") or ""))
+            target = devices_by_id.get(best.get("to"))
+            if target and target.get("device_type") == "endpoint":
+                endpoint_updates[str(best.get("to") or "")] = best
+            best["candidate_observation_count"] = len(links)
+            best["suppressed_observation_count"] = len(links) - 1
+            best["topology_decision"] = self._observed_link_selection_reason(best, len(links))
+
+        if not links_to_remove:
+            return False
+
+        self.links = [link for link in self.links if str(link.get("id") or "") not in links_to_remove]
+        for endpoint_id, link in endpoint_updates.items():
+            endpoint = devices_by_id.get(endpoint_id)
+            source = interface_index.get(str(link.get("from_interface") or ""))
+            if endpoint and source:
+                _, source_interface = source
+                self._update_endpoint_observation(endpoint, link, source_interface)
+        return True
+
+    def _observed_infrastructure_link_mac_key(self, target: dict[str, Any], link: dict[str, Any]) -> str:
+        remote_key = self._mac_label_key(link.get("remote_port"))
+        if not remote_key:
+            return ""
+        if remote_key not in self._infrastructure_device_mac_keys(target):
+            return ""
+        return remote_key
+
+    def _observed_link_score(
+        self,
+        link: dict[str, Any],
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+        infrastructure_interfaces: set[str],
+        infrastructure_ports: set[tuple[str, str]],
+        observed_link_count_by_interface: dict[str, int],
+    ) -> tuple[int, str]:
+        score = self._link_confidence(link)
+        from_interface_id = str(link.get("from_interface") or "")
+        if self._is_infrastructure_observation(link, interface_index, infrastructure_interfaces, infrastructure_ports):
+            score -= 1000
+        missing_polls = int(link.get("missing_polls") or 0)
+        if missing_polls > 0:
+            score -= missing_polls * 60
+        if from_interface_id and observed_link_count_by_interface.get(from_interface_id, 0) > 1:
+            score -= 140
+        source = interface_index.get(from_interface_id)
+        if source:
+            _, interface = source
+            if interface.get("oper_status") == "up":
+                score += 30
+            if interface.get("if_alias"):
+                score += 10
+            tagged_vlans = interface.get("vlan_tagged") or []
+            untagged_vlans = interface.get("vlan_untagged") or []
+            vlan_count = len(tagged_vlans) + len(untagged_vlans)
+            if vlan_count == 1:
+                score += 24
+            if vlan_count > 2:
+                score -= 220
+            if len(tagged_vlans) > 1:
+                score -= 80
+            label = " ".join(
+                str(value or "").lower()
+                for value in (interface.get("name"), interface.get("if_alias"), interface.get("if_descr"), link.get("local_port"))
+            )
+            if any(token in label for token in ("trunk", "uplink", "lwl", "lag", "port-channel", "etherchannel")):
+                score -= 180
+            if "qnap" in label or "nas" in label:
+                score += 60
+        return score, str(link.get("id") or "")
+
+    def _observed_link_selection_reason(self, link: dict[str, Any], candidate_count: int) -> str:
+        confidence = self._link_confidence(link)
+        port = link.get("local_port") or "unknown port"
+        evidence = link.get("evidence") or "observed evidence"
+        return (
+            f"Selected from {candidate_count} competing observation(s): {evidence} on {port}, "
+            f"confidence {confidence}."
+        )
+
+    def _is_infrastructure_observation(
+        self,
+        link: dict[str, Any],
+        interface_index: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+        infrastructure_interfaces: set[str],
+        infrastructure_ports: set[tuple[str, str]],
+    ) -> bool:
+        from_interface_id = str(link.get("from_interface") or "")
+        if from_interface_id and from_interface_id in infrastructure_interfaces:
+            return True
+        source = interface_index.get(from_interface_id)
+        device_id = str(link.get("from") or "")
+        port_keys = [self._port_key(link.get("local_port"))]
+        if source:
+            _, interface = source
+            port_keys.extend(
+                self._port_key(value)
+                for value in (interface.get("name"), interface.get("if_alias"), interface.get("if_descr"))
+            )
+        return any(key and (device_id, key) in infrastructure_ports for key in port_keys)
+
+    def _observed_link_mac_key(self, endpoint: dict[str, Any], link: dict[str, Any]) -> str:
+        for value in (
+            endpoint.get("mac"),
+            endpoint.get("observed_mac"),
+            endpoint.get("asset_mac"),
+            endpoint.get("fingerprint"),
+            endpoint.get("chassis_id"),
+            link.get("remote_port"),
+        ):
+            key = self._mac_label_key(value)
+            if key:
+                return key
+        return ""
+
+    def _update_endpoint_observation(
+        self, endpoint: dict[str, Any], link: dict[str, Any], source_interface: dict[str, Any]
+    ) -> None:
+        port_name = source_interface.get("name") or link.get("local_port") or ""
+        port_alias = source_interface.get("if_alias") or ""
+        endpoint["observed_local_port"] = port_name
+        endpoint["observed_local_port_alias"] = port_alias
+        endpoint["observed_source"] = link.get("evidence") or endpoint.get("observed_source") or "MAC table"
+        if port_alias and endpoint.get("name_source") not in {"mac-label", "device-label"}:
+            endpoint["name"] = port_alias
+        for interface in endpoint.get("interfaces", []) or []:
+            interface["if_alias"] = f"seen on {port_name}" if port_name else interface.get("if_alias", "")
+
+    def _port_key(self, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        text = re.sub(r"^(tengigabitethernet|tgigabitethernet|tgigaethernet|tgi|te)", "tg", text)
+        text = re.sub(r"^(gigaethernet|gigabitethernet|gi|ge)", "g", text)
+        text = re.sub(r"^(fastethernet|fa)", "fa", text)
+        text = re.sub(r"\b(tengigabitethernet|tgigabitethernet|tgigaethernet|tgi|te)\b", "tg", text)
+        text = re.sub(r"\b(gigaethernet|gigabitethernet|gi|ge)\b", "g", text)
+        text = re.sub(r"\b(fastethernet|fa)\b", "fa", text)
+        text = re.sub(r"[^a-z0-9]+", "", text)
+        return text
+
     def _should_replace_auto_discovery_item(self, item: dict[str, Any], seed_key: str | None) -> bool:
         if not seed_key or item.get("seed_key") != seed_key:
             return False
@@ -951,6 +1986,25 @@ class NetWatchState:
         candidate_chassis = self._normalize_identifier(candidate.get("chassis_id"))
         candidate_lldp_name = (candidate.get("lldp_sys_name") or "").strip().lower()
         candidate_mac = self._normalize_identifier(candidate.get("mac") or candidate.get("observed_mac"))
+        if candidate.get("device_type") == "endpoint" and candidate_mac:
+            for device_id, device in devices_by_id.items():
+                if device.get("status") == "pending":
+                    continue
+                device_fp = self._normalize_identifier(device.get("fingerprint"))
+                device_chassis = self._normalize_identifier(device.get("chassis_id"))
+                interface_ids = {
+                    self._normalize_identifier(interface.get("if_phys_address"))
+                    for interface in device.get("interfaces", [])
+                    if interface.get("if_phys_address")
+                }
+                device_mac = self._normalize_identifier(device.get("mac") or device.get("observed_mac"))
+                if candidate_mac and (candidate_mac == device_mac or candidate_mac in interface_ids):
+                    return device_id
+                if candidate_fp and device_fp and candidate_fp == device_fp:
+                    return device_id
+                if candidate_chassis and device_chassis and candidate_chassis == device_chassis:
+                    return device_id
+            return None
         for device_id, device in devices_by_id.items():
             if device.get("status") == "pending":
                 continue
@@ -1124,10 +2178,19 @@ class NetWatchState:
         self, links: list[dict[str, Any]], candidate_remap: dict[str, str], seed_key: str | None
     ) -> None:
         merged: dict[str, dict[str, Any]] = {}
+        devices_by_id = {device.get("id"): device for device in self.devices if device.get("id")}
         for existing_link in self.links:
             if seed_key and existing_link.get("seed_key") == seed_key:
-                continue
-            link = deepcopy(existing_link)
+                if not self._is_sticky_observed_infrastructure_mac_link(existing_link, devices_by_id):
+                    continue
+                missing_polls = int(existing_link.get("missing_polls") or 0) + 1
+                if missing_polls > OBSERVED_MAC_LINK_MISSING_POLL_CAP:
+                    continue
+                link = deepcopy(existing_link)
+                link["missing_polls"] = missing_polls
+                link["stale"] = True
+            else:
+                link = deepcopy(existing_link)
             link["from"] = candidate_remap.get(link["from"], link["from"])
             link["to"] = candidate_remap.get(link["to"], link["to"])
             if link.get("from") == link.get("to"):
@@ -1142,11 +2205,26 @@ class NetWatchState:
                 continue
             if seed_key:
                 link["seed_key"] = seed_key
+            link["missing_polls"] = 0
+            link["stale"] = False
+            link["last_seen"] = now_iso()
             link["id"] = self._stable_link_id(link)
             existing = merged.get(link["id"], {})
             merged[link["id"]] = {**existing, **link}
         self.links = list(merged.values())
         self._confirm_reciprocal_links()
+
+    def _is_sticky_observed_infrastructure_mac_link(
+        self, link: dict[str, Any], devices_by_id: dict[str, dict[str, Any]]
+    ) -> bool:
+        if link.get("status") != "observed":
+            return False
+        if "mac table" not in str(link.get("evidence") or "").lower():
+            return False
+        target = devices_by_id.get(link.get("to"))
+        if not target or not self._is_infrastructure_device(target):
+            return False
+        return bool(self._observed_infrastructure_link_mac_key(target, link))
 
     def _stable_link_id(self, link: dict[str, Any]) -> str:
         from_if = str(link.get("from_interface") or link.get("local_port") or "any").replace("/", "-")
@@ -1154,7 +2232,22 @@ class NetWatchState:
         return f"link-{link['from']}-{link['to']}-{from_if}-{to_if}"
 
     def _confirm_reciprocal_links(self) -> None:
+        devices_by_id = {device.get("id"): device for device in self.devices if device.get("id")}
         for link in self.links:
+            from_device = devices_by_id.get(link.get("from"))
+            to_device = devices_by_id.get(link.get("to"))
+            if (
+                link.get("status") == "pending"
+                and str(link.get("evidence") or "").lower().startswith("lldp")
+                and from_device
+                and to_device
+                and from_device.get("status") != "pending"
+                and to_device.get("status") != "pending"
+                and self._is_infrastructure_device(from_device)
+                and self._is_infrastructure_device(to_device)
+            ):
+                link["status"] = "confirmed"
+                link["evidence"] = "LLDP one side + SNMP seed match"
             for other in self.links:
                 if link is other:
                     continue

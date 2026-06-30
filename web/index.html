@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NetWatch Light</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=portdesc-labels-1" />
+    <link rel="stylesheet" href="/assets/styles.css?v=phase5-ops-1" />
   </head>
   <body class="presentation-mode is-home">
     <div class="presentation-shell" id="presentationShell">
@@ -35,6 +35,7 @@
           <button class="showcase-zoom-button" type="button" id="showcaseZoomIn" aria-label="Zoom in map">+</button>
           <button class="showcase-zoom-button" type="button" id="showcaseZoomOut" aria-label="Zoom out map">-</button>
         </div>
+        <aside class="topology-evidence-panel" id="topologyEvidencePanel" aria-label="Topology evidence"></aside>
         <div class="showcase-map" id="showcaseMap">
           <div class="showcase-map-plane" id="showcaseMapPlane">
             <svg class="showcase-link-layer" id="showcaseLinkLayer" aria-hidden="true"></svg>
@@ -60,6 +61,7 @@
           </button>
         </div>
         <span class="dashboard-seed-summary" id="presentationSeedSummary">mock mode</span>
+        <div class="dashboard-ops-grid" id="dashboardOpsGrid" aria-label="Operational health"></div>
 
         <aside class="dashboard-live">
           <span>Worker Events</span>
@@ -201,6 +203,6 @@
     <span id="backendState" hidden>Connecting</span>
     <span id="eventStreamState" hidden>WebSocket pending</span>
 
-    <script src="/assets/app.js?v=presentation-scroll-stops-2" defer></script>
+    <script src="/assets/app.js?v=phase5-ops-1" defer></script>
   </body>
 </html>

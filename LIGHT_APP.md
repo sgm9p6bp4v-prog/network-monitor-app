@@ -8,10 +8,17 @@ This is the first working lightweight version of NetWatch. It is intentionally s
 - Static frontend served by the backend.
 - Mock FS-like SNMP inventory.
 - Live seed discovery against a real SNMP switch.
-- Local JSON persistence for inventory, links, alerts, events, settings and layout.
-- Local JSON persistence for SNMP seed credentials in the light build.
+- Database persistence for inventory, links, alerts, events, settings, labels, layout and interface history.
+- One-time migration from the legacy local JSON state file when the database is empty.
+- Local database persistence for SNMP seed credentials in the light build.
 - Multi-seed runtime polling with credentials reloaded after backend restart.
-- Backend auto-poll scheduler with configurable interval.
+- Dedicated poller process with configurable interval.
+- Versioned metric catalog loaded from `config/metric_catalog.yaml`.
+- Structured metric sample persistence for interface status, counters and traffic gauges.
+- Poll run history with status, duration, seed count, successes and failures.
+- Encrypted SNMP credential storage for the local database build.
+- Local backup/restore commands for the SQLite DB, master key and config YAML files.
+- Automatic backend tests for credential encryption, backup/restore and metric catalog behavior.
 - Device list and device detail.
 - LLDP topology with confirmed and pending links.
 - Alert lifecycle: active, acknowledged, resolved.
@@ -21,12 +28,14 @@ This is the first working lightweight version of NetWatch. It is intentionally s
 ## What is still mocked
 
 - Redis/arq worker.
-- PostgreSQL/TimescaleDB.
-- Credential encryption.
+- Dedicated production PostgreSQL deployment.
 - Docker secrets.
-- Alembic migrations.
 
-The light app persists runtime state in `data/netwatch_state.json`. That file is ignored by git. In this test build, SNMP communities and SNMPv3 secrets are also stored there in plaintext so live polling can resume after a backend restart. This is useful for LAN testing, but it is not the final security model: production still needs encrypted credential storage and key management.
+By default, the light app persists runtime state in `data/netwatch.db` using SQLite. Set `DATABASE_URL` to point to PostgreSQL when moving beyond local testing. If `data/netwatch_state.json` exists and the database is empty, it is imported automatically on startup.
+
+SNMP communities and SNMPv3 secrets are encrypted before they are written to the local database. The app reads the master key from `NETWATCH_MASTER_KEY`, then `NETWATCH_MASTER_KEY_FILE`, and finally falls back to a generated local key at `data/netwatch_master.key`.
+
+Keep the master key with the database backup. Losing the key means losing access to saved SNMP credentials.
 
 ## Run locally
 
@@ -37,11 +46,27 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+Optional database migration command:
+
+```bash
+.venv/bin/alembic upgrade head
+```
+
 Start the app:
 
 ```bash
 .venv/bin/python -m uvicorn netwatch_light.main:app --host 127.0.0.1 --port 5173 --reload
 ```
+
+Start the poller in a second terminal:
+
+```bash
+.venv/bin/python -m netwatch_light.poller
+```
+
+The web server serves the UI/API. The poller reads seed credentials from the same database, performs SNMP polling, and writes refreshed topology, interface samples, alerts and events back to the database.
+
+The light build now also writes structured metric samples and poll run history into the local database. This is not a full TimescaleDB deployment yet, but it keeps metric names, labels and poller state explicit enough to migrate cleanly later.
 
 Open:
 
@@ -67,3 +92,27 @@ The app reads:
 - `LLDP-MIB`: one-sided neighbor candidates plus local/remote port evidence when available.
 
 Use the `SNMP Seed` button in the dashboard presentation UI for the same workflow without opening the old sidebar shell.
+
+## Backup and restore
+
+Create a local backup archive:
+
+```bash
+scripts/backup_light_app.sh
+```
+
+Restore a backup archive:
+
+```bash
+scripts/restore_light_app.sh path/to/netwatch-light-backup.tar.gz --force
+```
+
+Stop the web server and poller before restoring. Restore preserves overwritten files with a `.pre-restore-<timestamp>` suffix.
+
+## Tests
+
+Run the automated backend tests:
+
+```bash
+.venv/bin/python -m pytest
+```

@@ -1,0 +1,80 @@
+version: 1
+defaults:
+  retention_seconds: 3600
+  max_samples_per_target: 720
+labels:
+  interface:
+    - device_id
+    - interface_id
+    - if_name
+metrics:
+  - name: interface.admin_status
+    target_type: interface
+    value_type: state
+    unit: status
+    labels: [device_id, interface_id, if_name]
+  - name: interface.oper_status
+    target_type: interface
+    value_type: state
+    unit: status
+    labels: [device_id, interface_id, if_name]
+  - name: interface.in_octets
+    target_type: interface
+    value_type: counter
+    unit: octets
+    labels: [device_id, interface_id, if_name]
+  - name: interface.out_octets
+    target_type: interface
+    value_type: counter
+    unit: octets
+    labels: [device_id, interface_id, if_name]
+  - name: interface.in_bps
+    target_type: interface
+    value_type: gauge
+    unit: bit/s
+    labels: [device_id, interface_id, if_name]
+  - name: interface.out_bps
+    target_type: interface
+    value_type: gauge
+    unit: bit/s
+    labels: [device_id, interface_id, if_name]
+  - name: interface.in_errors
+    target_type: interface
+    value_type: counter
+    unit: errors
+    labels: [device_id, interface_id, if_name]
+  - name: interface.out_errors
+    target_type: interface
+    value_type: counter
+    unit: errors
+    labels: [device_id, interface_id, if_name]
+  - name: interface.in_discards
+    target_type: interface
+    value_type: counter
+    unit: discards
+    labels: [device_id, interface_id, if_name]
+  - name: interface.out_discards
+    target_type: interface
+    value_type: counter
+    unit: discards
+    labels: [device_id, interface_id, if_name]
+  - name: interface.in_error_rate
+    target_type: interface
+    value_type: gauge
+    unit: errors/s
+    labels: [device_id, interface_id, if_name]
+  - name: interface.out_error_rate
+    target_type: interface
+    value_type: gauge
+    unit: errors/s
+    labels: [device_id, interface_id, if_name]
+  - name: interface.in_discard_rate
+    target_type: interface
+    value_type: gauge
+    unit: discards/s
+    labels: [device_id, interface_id, if_name]
+  - name: interface.out_discard_rate
+    target_type: interface
+    value_type: gauge
+    unit: discards/s
+    labels: [device_id, interface_id, if_name]

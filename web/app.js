@@ -26,6 +26,7 @@ const appState = {
     metric_catalog: [],
     seeds: [],
     runtime: {},
+    operational_summary: {},
     device_labels: {},
     settings: { polling: {}, security: {} }
   }
@@ -43,10 +44,12 @@ const landingRgb = [216, 211, 235];
 const mapRgb = [252, 252, 239];
 const dashboardRgb = [217, 217, 217];
 const patternSectionRatio = 1 / 3;
-const presentationScrollHoldMs = 1000;
+const presentationScrollDurationMs = 2000;
+const presentationScrollSettleMs = 260;
 const presentationScrollHold = {
   lockedUntil: 0,
-  targetName: ""
+  targetName: "",
+  frame: 0
 };
 
 function clamp(value, min, max) {
@@ -162,8 +165,14 @@ function enterPresentationMode(view = "home", behavior = "smooth") {
     devices: devicesSection?.offsetTop ?? window.innerHeight * (3 + patternSectionRatio)
   };
   const top = targets[view] ?? 0;
-  window.scrollTo({ top, behavior });
-  window.requestAnimationFrame(updatePresentationProgress);
+  if (behavior === "smooth") {
+    animatePresentationScrollTo(top);
+  } else {
+    window.cancelAnimationFrame(presentationScrollHold.frame);
+    presentationScrollHold.frame = 0;
+    window.scrollTo({ top, behavior: "auto" });
+    window.requestAnimationFrame(updatePresentationProgress);
+  }
   if (view === "home" && window.location.hash) {
     history.pushState(null, "", window.location.pathname + window.location.search);
   } else if (view !== "home" && window.location.hash !== `#${view}`) {
@@ -197,6 +206,41 @@ function updatePresentationHashForView(view) {
   if (window.location.hash !== `#${view}`) {
     history.pushState(null, "", `#${view}`);
   }
+}
+
+function easePresentationScroll(progress) {
+  return progress < 0.5
+    ? 4 * progress * progress * progress
+    : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+}
+
+function animatePresentationScrollTo(top, duration = presentationScrollDurationMs) {
+  window.cancelAnimationFrame(presentationScrollHold.frame);
+  const startTop = window.scrollY;
+  const distance = top - startTop;
+
+  if (Math.abs(distance) < 1 || duration <= 0) {
+    window.scrollTo({ top, behavior: "auto" });
+    updatePresentationProgress();
+    return;
+  }
+
+  const startTime = performance.now();
+  const step = (now) => {
+    const progress = clamp((now - startTime) / duration, 0, 1);
+    const eased = easePresentationScroll(progress);
+    window.scrollTo({ top: startTop + distance * eased, behavior: "auto" });
+    updatePresentationProgress();
+    if (progress < 1) {
+      presentationScrollHold.frame = window.requestAnimationFrame(step);
+    } else {
+      window.scrollTo({ top, behavior: "auto" });
+      updatePresentationProgress();
+      presentationScrollHold.frame = 0;
+    }
+  };
+
+  presentationScrollHold.frame = window.requestAnimationFrame(step);
 }
 
 function resetPresentationScrollHoldIfAwayFromAnchor() {
@@ -281,18 +325,11 @@ function maybeHoldPresentationWheel(event) {
   const nextAnchor = anchors[nextIndex];
   if (!nextAnchor || nextIndex === currentIndex) return;
 
-  const immediateLandingToMap = currentAnchor.name === "home" && nextAnchor.name === "topology" && direction === "down";
-  window.scrollTo({ top: nextAnchor.top, behavior: "smooth" });
-  window.requestAnimationFrame(updatePresentationProgress);
+  animatePresentationScrollTo(nextAnchor.top);
   updatePresentationHashForView(nextAnchor.name);
 
-  if (immediateLandingToMap) {
-    presentationScrollHold.lockedUntil = now + 520;
-    presentationScrollHold.targetName = nextAnchor.name;
-  } else {
-    presentationScrollHold.lockedUntil = now + presentationScrollHoldMs + 420;
-    presentationScrollHold.targetName = nextAnchor.name;
-  }
+  presentationScrollHold.lockedUntil = now + presentationScrollDurationMs + presentationScrollSettleMs;
+  presentationScrollHold.targetName = nextAnchor.name;
 }
 
 function letterizeLandingTitle() {
@@ -449,6 +486,9 @@ function getSeedSummaryText() {
   const runtime = appState.snapshot.runtime || {};
   const mode = appState.snapshot.mode || "mock";
   const auto = polling.backend_auto_poll ? `auto ${polling.backend_interval_seconds || 30}s` : "manual poll";
+  const pollerStatus = runtime.external_poller_alive
+    ? `poller ${polling.external_poller_status || "running"}`
+    : "poller offline";
   if (seeds.length === 0) return `${mode} mode / ${auto}`;
   const loadedCredentials = Number(runtime.seed_credentials_loaded || 0);
   const savedCredentials = Number(runtime.seed_credentials_saved || 0);
@@ -459,7 +499,7 @@ function getSeedSummaryText() {
   }
   const ok = seeds.filter((seed) => seed.status === "up").length;
   const credentialSummary = savedCredentials > 0 ? ` / ${loadedCredentials} credentials loaded` : "";
-  return `${seeds.length} seed / ${ok} up${credentialSummary} / ${auto}`;
+  return `${seeds.length} seed / ${ok} up${credentialSummary} / ${auto} / ${pollerStatus}`;
 }
 
 function updateSeedSummary() {
@@ -487,6 +527,128 @@ function updatePollActionButtons(isBusy = false) {
       button.textContent = label;
     }
   });
+}
+
+function formatAge(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "n/a";
+  const value = Math.max(0, Number(seconds));
+  if (value < 60) return `${Math.round(value)}s`;
+  if (value < 3600) return `${Math.round(value / 60)}m`;
+  if (value < 86400) return `${Math.round(value / 3600)}h`;
+  return `${Math.round(value / 86400)}d`;
+}
+
+function formatDurationMs(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "n/a";
+  const ms = Number(value);
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms / 60_000)}m`;
+}
+
+function getOperationalSummary() {
+  return appState.snapshot.operational_summary || {};
+}
+
+function operationalTone(status) {
+  if (["ok", "fresh", "strong", "succeeded"].includes(status)) return "ok";
+  if (["warning", "stale", "mixed", "partial"].includes(status)) return "warning";
+  if (["down", "failed"].includes(status)) return "down";
+  return "neutral";
+}
+
+function renderProblemRows(problems) {
+  if (!problems?.length) {
+    return `<li><span class="ops-problem-dot ok"></span><strong>Clear</strong><small>No open operational issue</small></li>`;
+  }
+  return problems
+    .slice(0, 3)
+    .map(
+      (problem) => `
+        <li>
+          <span class="ops-problem-dot ${escapeHtml(problem.severity || "info")}"></span>
+          <strong>${escapeHtml(problem.title || "Problem")}</strong>
+          <small>${escapeHtml(problem.detail || "")}</small>
+        </li>
+      `
+    )
+    .join("");
+}
+
+function renderDashboardOps() {
+  const target = document.getElementById("dashboardOpsGrid");
+  if (!target) return;
+  const ops = getOperationalSummary();
+  const poll = ops.poll_health || {};
+  const topology = ops.topology_evidence || {};
+  const latest = ops.latest_data || {};
+  const problems = ops.problems || [];
+  const lastRun = poll.last_run || appState.snapshot.runtime?.last_poll_run || {};
+  const pollStatus = poll.poller_alive ? (lastRun.status || poll.poller_status || "running") : "offline";
+  const latestStatus = latest.status || "unknown";
+  const topologyStatus = topology.status || "empty";
+  const problemStatus = problems.length ? problems[0].severity || "warning" : "ok";
+  const tiles = [
+    {
+      label: "Poll Health",
+      value: pollStatus,
+      status: poll.status || pollStatus,
+      meta: `${poll.auto_poll ? `auto ${poll.interval_seconds || 30}s` : "manual"} / ${poll.poller_status || "unknown"}`,
+      detail: `last ${formatDurationMs(lastRun.duration_ms)} / ${lastRun.successes ?? 0} ok / ${lastRun.failures ?? 0} failed`
+    },
+    {
+      label: "Topology Evidence",
+      value: topology.total_links ? `${topology.score || 0}%` : "n/a",
+      status: topologyStatus,
+      meta: `${topology.confirmed_links || 0} confirmed / ${topology.pending_links || 0} pending`,
+      detail: `${topology.low_confidence_links || 0} weak / ${topology.directness?.direct || 0} direct / ${topology.directness?.["probable-direct"] || 0} probable`
+    },
+    {
+      label: "Latest Data",
+      value: latestStatus,
+      status: latestStatus,
+      meta: `newest ${formatAge(latest.latest_sample_age_seconds)} ago`,
+      detail: `${latest.interfaces_with_traffic || 0}/${latest.interfaces_total || 0} interfaces with traffic`
+    },
+    {
+      label: "Problems",
+      value: String(problems.length || 0),
+      status: problemStatus,
+      meta: problems[0]?.title || "no open problems",
+      detailHtml: `<ol class="ops-problem-list">${renderProblemRows(problems)}</ol>`
+    }
+  ];
+
+  target.innerHTML = tiles
+    .map(
+      (tile) => `
+        <article class="ops-tile ${operationalTone(tile.status)}">
+          <span>${escapeHtml(tile.label)}</span>
+          <strong>${escapeHtml(tile.value)}</strong>
+          <small>${escapeHtml(tile.meta)}</small>
+          ${tile.detailHtml || `<em>${escapeHtml(tile.detail || "")}</em>`}
+        </article>
+      `
+    )
+    .join("");
+}
+
+function renderTopologyEvidencePanel() {
+  const target = document.getElementById("topologyEvidencePanel");
+  if (!target) return;
+  const topology = getOperationalSummary().topology_evidence || {};
+  const sources = topology.sources || {};
+  const sourceText = Object.entries(sources)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 3)
+    .map(([source, count]) => `${source} ${count}`)
+    .join(" / ");
+  target.innerHTML = `
+    <span>Topology Evidence</span>
+    <strong>${topology.total_links ? `${topology.score || 0}%` : "n/a"}</strong>
+    <small>${topology.confirmed_links || 0} confirmed / ${topology.pending_links || 0} pending / ${topology.low_confidence_links || 0} weak</small>
+    <em>${escapeHtml(sourceText || "waiting for LLDP/FDB evidence")}</em>
+  `;
 }
 
 function setLiveSetupOpen(open) {
@@ -664,6 +826,7 @@ function renderPresentationDashboard() {
   const cardsTarget = document.getElementById("presentationDashboardCards");
   const eventsTarget = document.getElementById("presentationEventList");
   if (!cardsTarget || !eventsTarget) return;
+  renderDashboardOps();
 
   const managed = getManagedDevices();
   const up = managed.filter((device) => device.status === "up").length;
@@ -1583,12 +1746,13 @@ function renderTopology() {
       const x2 = to.x + nodeWidth / 2;
       const y2 = to.y + nodeHeight / 2;
       const stroke = link.status === "confirmed" ? "#1c7f5a" : "#a76505";
-      const dash = link.status === "pending" ? "8 7" : "0";
+      const dash = link.line_style === "solid" || link.status === "confirmed" ? "0" : "8 7";
+      const opacity = Math.max(0.35, Math.min(1, Number(link.confidence || 45) / 100));
       const label = [link.local_port, link.remote_port].filter(Boolean).join(" -> ");
       const labelSvg = label
         ? `<text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 8}" class="link-label">${escapeHtml(label)}</text>`
         : "";
-      return `<g><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="3" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
+      return `<g><title>${escapeHtml(topologyLinkTitle(link))}</title><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="3" stroke-opacity="${opacity}" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
     })
     .join("");
 
@@ -1625,13 +1789,9 @@ function compareTopologyDeviceIds(deviceMap) {
 }
 
 function getTopologySignature(devices, links) {
-  const layoutVersion = "diagram-v1";
+  const layoutVersion = "diagram-v2-stable-nodes";
   const nodePart = devices.map((device) => device.id).sort().join("|");
-  const linkPart = links
-    .map((link) => [link.from, link.to].sort().join("<>"))
-    .sort()
-    .join("|");
-  return `${layoutVersion}::${nodePart}::${linkPart}`;
+  return `${layoutVersion}::${nodePart}`;
 }
 
 function getValidTopologyLinks(devices, links) {
@@ -1639,9 +1799,27 @@ function getValidTopologyLinks(devices, links) {
   return links.filter((link) => ids.has(link.from) && ids.has(link.to) && link.from !== link.to);
 }
 
+function topologyLinkPriority(link) {
+  const confidence = Number(link.confidence || 0);
+  const statusBonus = link.status === "confirmed" ? 120 : link.status === "pending" ? -20 : 0;
+  const directBonus = link.directness === "direct" ? 80 : link.directness === "probable-direct" ? 45 : 0;
+  return confidence + statusBonus + directBonus;
+}
+
+function topologyLinkTitle(link) {
+  const confidence = Number(link.confidence || 0);
+  const evidence = link.evidence || "No evidence";
+  const decision = link.topology_decision || "";
+  const directness = link.directness || "unknown";
+  return `${evidence} / ${confidence}% ${link.confidence_label || ""} / ${directness}${decision ? ` / ${decision}` : ""}`;
+}
+
 function buildTopologyAdjacency(devices, links) {
   const adjacency = new Map(devices.map((device) => [device.id, new Set()]));
-  getValidTopologyLinks(devices, links).forEach((link) => {
+  getValidTopologyLinks(devices, links)
+    .slice()
+    .sort((a, b) => topologyLinkPriority(b) - topologyLinkPriority(a))
+    .forEach((link) => {
     adjacency.get(link.from)?.add(link.to);
     adjacency.get(link.to)?.add(link.from);
   });
@@ -1814,7 +1992,10 @@ function getTopologyParentMap(devices, links, deviceMap) {
   const parentByChild = new Map();
   const childrenByParent = new Map();
 
-  getValidTopologyLinks(devices, links).forEach((link) => {
+  getValidTopologyLinks(devices, links)
+    .slice()
+    .sort((a, b) => topologyLinkPriority(b) - topologyLinkPriority(a))
+    .forEach((link) => {
     if (!ids.has(link.from) || !ids.has(link.to)) return;
     const from = deviceMap.get(link.from);
     const to = deviceMap.get(link.to);
@@ -2447,12 +2628,13 @@ function renderShowcaseLinks() {
       const toBox = getStableLogicalNodeBox(to);
       const fromPoint = getEdgePoint(fromBox, toBox);
       const toPoint = getEdgePoint(toBox, fromBox);
-      const dash = link.status === "confirmed" ? "0" : "8 7";
+      const dash = link.line_style === "solid" || link.status === "confirmed" ? "0" : "8 7";
+      const opacity = Math.max(0.35, Math.min(1, Number(link.confidence || 45) / 100));
       const label = [link.local_port, link.remote_port].filter(Boolean).join(" -> ");
       const labelSvg = label
         ? `<text x="${(fromPoint.x + toPoint.x) / 2}" y="${(fromPoint.y + toPoint.y) / 2 - 7}" class="showcase-link-label">${escapeHtml(label)}</text>`
         : "";
-      return `<g data-link-from="${escapeHtml(link.from)}" data-link-to="${escapeHtml(link.to)}"><line x1="${fromPoint.x}" y1="${fromPoint.y}" x2="${toPoint.x}" y2="${toPoint.y}" stroke="#263746" stroke-width="2" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
+      return `<g data-link-from="${escapeHtml(link.from)}" data-link-to="${escapeHtml(link.to)}"><title>${escapeHtml(topologyLinkTitle(link))}</title><line x1="${fromPoint.x}" y1="${fromPoint.y}" x2="${toPoint.x}" y2="${toPoint.y}" stroke="#263746" stroke-width="2" stroke-opacity="${opacity}" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
     })
     .join("");
 }
@@ -2575,6 +2757,7 @@ function renderShowcaseTopology() {
   const nodes = document.getElementById("showcaseNodeLayer");
   const svg = document.getElementById("showcaseLinkLayer");
   if (!stage || !plane || !nodes || !svg) return;
+  renderTopologyEvidencePanel();
 
   const width = stage.clientWidth || window.innerWidth;
   const height = stage.clientHeight || window.innerHeight;
@@ -2607,11 +2790,18 @@ function renderShowcaseTopology() {
 
   const layout = computeShowcaseTopologyLayout(devices, links, width, height, cardWidth, cardHeight);
   if (signature !== appState.topologyLayoutSignature) {
-    appState.topologyPositions = { ...layout.positions };
+    const previousPositions = appState.topologyPositions || {};
+    const hadLayout = Boolean(appState.topologyLayoutSignature);
+    appState.topologyPositions = devices.reduce((positions, device) => {
+      positions[device.id] = previousPositions[device.id] || layout.positions[device.id];
+      return positions;
+    }, {});
     appState.topologyLayoutSignature = signature;
-    appState.topologyZoomUserSet = false;
-    appState.topologyPan = { x: 0, y: 0 };
-    shouldCenterOnFocus = true;
+    if (!hadLayout) {
+      appState.topologyZoomUserSet = false;
+      appState.topologyPan = { x: 0, y: 0 };
+      shouldCenterOnFocus = true;
+    }
   } else {
     devices.forEach((device) => {
       appState.topologyPositions[device.id] ||= layout.positions[device.id];
@@ -2788,8 +2978,16 @@ function renderSettings() {
       .join("");
   }
   if (metricCatalog) {
-    metricCatalog.innerHTML = appState.snapshot.metric_catalog
-      .map((metric) => `<span class="metric-chip">${metric}</span>`)
+    const catalogMetrics = appState.snapshot.metric_catalog_details?.metrics || [];
+    const metricNames = appState.snapshot.metric_catalog || [];
+    const chips = catalogMetrics.length
+      ? catalogMetrics.map((metric) => ({
+          name: metric.name,
+          title: `${metric.target_type || "target"} / ${metric.value_type || "value"} / ${metric.unit || "unit"}`
+        }))
+      : metricNames.map((name) => ({ name, title: name }));
+    metricCatalog.innerHTML = chips
+      .map((metric) => `<span class="metric-chip" title="${escapeHtml(metric.title)}">${escapeHtml(metric.name)}</span>`)
       .join("");
   }
   if (liveModeBadge) {
@@ -2999,6 +3197,20 @@ function stopAutoPoll() {
   }
 }
 
+function startSnapshotRefresh() {
+  if (appState.snapshotRefreshTimer) {
+    window.clearInterval(appState.snapshotRefreshTimer);
+  }
+  appState.snapshotRefreshTimer = window.setInterval(async () => {
+    try {
+      await loadSnapshot();
+    } catch (error) {
+      const streamState = document.getElementById("eventStreamState");
+      if (streamState) streamState.textContent = `Refresh failed: ${error.message}`;
+    }
+  }, 10000);
+}
+
 function syncSeedVersionFields() {
   const version = document.getElementById("seedVersion")?.value || "2c";
   document.querySelectorAll(".v2-field").forEach((field) => {
@@ -3024,6 +3236,8 @@ function renderAll() {
   renderDeviceDetail();
   renderTopology();
   renderShowcaseTopology();
+  renderTopologyEvidencePanel();
+  renderDashboardOps();
   renderPresentationDashboard();
   renderPresentationDevices();
   renderDeviceHistory();
@@ -3126,6 +3340,7 @@ startDotTunnel();
 updatePresentationProgress();
 loadSnapshot().then(() => {
   connectEvents();
+  startSnapshotRefresh();
   const view = window.location.hash.replace("#", "");
   if (view === "history") {
     switchView("history", "auto");

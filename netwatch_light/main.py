@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -11,20 +10,28 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .polling import (
+    load_seed_configs,
+    poll_live_seeds,
+    seed_credentials_record,
+    seed_key,
+    seed_metadata,
+)
 from .snmp_live import SnmpSeedConfig, discover_seed
 from .state import NetWatchState
+from .storage import default_database_url
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT_DIR / "web"
 STATE_PATH = ROOT_DIR / "data" / "netwatch_state.json"
+DATABASE_URL = default_database_url(ROOT_DIR)
 
 app = FastAPI(title="NetWatch Light", version="0.1.0")
-state = NetWatchState(STATE_PATH)
+state = NetWatchState(STATE_PATH, DATABASE_URL)
 subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 seed_configs: dict[str, SnmpSeedConfig] = {}
 poll_lock = asyncio.Lock()
-scheduler_task: asyncio.Task[None] | None = None
 
 
 class SnmpSeedRequest(BaseModel):
@@ -85,166 +92,53 @@ async def publish(message: dict[str, Any]) -> None:
         subscribers.discard(queue)
 
 
-def seed_key(config: SnmpSeedConfig) -> str:
-    return f"{config.host}:{config.port}"
-
-
-def seed_metadata(config: SnmpSeedConfig, discovery: dict[str, Any], status: str = "up") -> dict[str, Any]:
-    key = seed_key(config)
-    system = discovery.get("system", {})
-    return {
-        "key": key,
-        "host": config.host,
-        "port": config.port,
-        "version": config.version,
-        "sys_name": system.get("sys_name") or config.host,
-        "sys_object_id": system.get("sys_object_id") or "unknown",
-        "status": status,
-        "last_error": "",
-        "last_counts": discovery.get("counts", {}),
-    }
-
-
-def seed_credentials_record(config: SnmpSeedConfig) -> dict[str, Any]:
-    return {
-        "key": seed_key(config),
-        "host": config.host,
-        "port": config.port,
-        "version": config.version,
-        "community": config.community,
-        "username": config.username,
-        "auth_key": config.auth_key,
-        "priv_key": config.priv_key,
-        "auth_protocol": config.auth_protocol,
-        "priv_protocol": config.priv_protocol,
-    }
-
-
-def seed_config_from_record(record: dict[str, Any]) -> SnmpSeedConfig:
-    host = str(record.get("host") or "").strip()
-    if not host:
-        raise ValueError("seed credential record is missing host")
-    return SnmpSeedConfig(
-        host=host,
-        port=int(record.get("port") or 161),
-        version=str(record.get("version") or "2c"),
-        community=str(record.get("community") or ""),
-        username=str(record.get("username") or ""),
-        auth_key=str(record.get("auth_key") or ""),
-        priv_key=str(record.get("priv_key") or ""),
-        auth_protocol=str(record.get("auth_protocol") or "SHA"),
-        priv_protocol=str(record.get("priv_protocol") or "AES"),
-    )
-
-
 def load_persisted_seed_configs() -> int:
-    loaded = 0
-    for record in state.seed_credentials:
-        try:
-            config = seed_config_from_record(record)
-        except (TypeError, ValueError):
-            continue
-        seed_configs[seed_key(config)] = config
-        loaded += 1
-    return loaded
-
-
-async def poll_live_seeds(source: str) -> dict[str, Any]:
-    if not seed_configs and state.seed_credentials:
-        load_persisted_seed_configs()
-    if not seed_configs:
-        result = state.run_poll()
-        await publish({"type": "poll.skipped", "event": result["event"]})
-        return result
-
-    successes = 0
-    failures = 0
-    last_result: dict[str, Any] | None = None
-    async with poll_lock:
-        for key, config in list(seed_configs.items()):
-            try:
-                discovery = await discover_seed(config, labeled_macs=set(state.mac_labels))
-            except Exception as exc:
-                failures += 1
-                last_result = state.mark_live_poll_failed(str(exc), key)
-                await publish({"type": "poll.failed", "event": last_result["event"], "seed": key})
-                continue
-            successes += 1
-            state.register_live_seed(seed_metadata(config, discovery))
-            last_result = state.import_live_discovery(discovery, key)
-            await publish({"type": "poll.completed", "event": last_result["event"], "seed": key})
-
-    if len(seed_configs) > 1:
-        event = state.add_event(f"Live {source} finished: {successes} seed(s) ok, {failures} failed")
-        last_result = {"event": event, "snapshot": state.snapshot(), "successes": successes, "failures": failures}
-
-    return last_result or {"event": state.add_event("Live poll skipped: no seeds configured"), "snapshot": state.snapshot()}
-
-
-def scheduler_interval_seconds() -> int:
-    polling = state.settings.get("polling", {})
-    return int(polling.get("backend_interval_seconds", 30) or 30)
-
-
-async def scheduler_loop() -> None:
-    while True:
-        await asyncio.sleep(scheduler_interval_seconds())
-        if state.mode == "live" and seed_configs:
-            await poll_live_seeds("scheduled poll")
-
-
-def start_scheduler() -> None:
-    global scheduler_task
-    if scheduler_task and not scheduler_task.done():
-        return
-    scheduler_task = asyncio.create_task(scheduler_loop())
-    state.settings.setdefault("polling", {})["backend_status"] = "running"
-    state.persist()
-
-
-async def stop_scheduler() -> None:
-    global scheduler_task
-    if scheduler_task and not scheduler_task.done():
-        scheduler_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await scheduler_task
-    scheduler_task = None
-    state.settings.setdefault("polling", {})["backend_status"] = "stopped"
-    state.persist()
+    return len(load_seed_configs(state, seed_configs))
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    state.reload()
     load_persisted_seed_configs()
-    if state.settings.get("polling", {}).get("backend_auto_poll"):
-        start_scheduler()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    await stop_scheduler()
+    return None
 
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "netwatch-light"}
+    state.reload()
+    return {"status": "ok", "service": "netwatch-light", "storage": state.storage_backend}
 
 
 @app.get("/api/snapshot")
 async def snapshot(response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
+    state.reload()
     data = state.snapshot()
     data["runtime"] = {
         "seed_credentials_loaded": len(seed_configs),
         "seed_credentials_saved": len(state.seed_credentials),
-        "scheduler_running": scheduler_task is not None and not scheduler_task.done(),
+        "storage_backend": state.storage_backend,
+        "external_poller_alive": state.is_external_poller_alive(),
+        "last_poll_run": state.poll_runs[0] if state.poll_runs else None,
     }
     return data
+
+
+@app.get("/api/poll-runs")
+async def poll_runs(response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    state.reload()
+    return {"poll_runs": state.poll_runs}
 
 
 @app.get("/api/devices/{device_id}/history")
 async def device_history(device_id: str, response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
+    state.reload()
     result = state.get_device_history(device_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -253,8 +147,14 @@ async def device_history(device_id: str, response: Response) -> dict[str, Any]:
 
 @app.post("/api/poll")
 async def run_poll() -> dict[str, Any]:
+    state.reload()
     if state.mode == "live":
-        return await poll_live_seeds("manual poll")
+        if state.is_external_poller_alive():
+            result = state.request_manual_poll("manual poll")
+            await publish({"type": "poll.queued", "event": result["event"]})
+            return result
+        async with poll_lock:
+            return await poll_live_seeds(state, "manual poll fallback", seed_configs, publish)
     result = state.run_poll()
     await publish({"type": "poll.completed", "event": result["event"]})
     return result
@@ -262,8 +162,14 @@ async def run_poll() -> dict[str, Any]:
 
 @app.post("/api/discovery")
 async def run_discovery() -> dict[str, Any]:
+    state.reload()
     if state.mode == "live":
-        return await poll_live_seeds("LLDP discovery")
+        if state.is_external_poller_alive():
+            result = state.request_manual_poll("LLDP discovery")
+            await publish({"type": "poll.queued", "event": result["event"]})
+            return result
+        async with poll_lock:
+            return await poll_live_seeds(state, "LLDP discovery fallback", seed_configs, publish)
     result = state.run_discovery()
     await publish({"type": "discovery.completed", "event": result["event"]})
     return result
@@ -271,17 +177,15 @@ async def run_discovery() -> dict[str, Any]:
 
 @app.post("/api/polling")
 async def update_polling(payload: PollingRequest) -> dict[str, Any]:
+    state.reload()
     result = state.set_backend_polling(payload.enabled, payload.interval_seconds)
-    if payload.enabled:
-        start_scheduler()
-    else:
-        await stop_scheduler()
     await publish({"type": "polling.updated", "event": result["event"]})
     return result
 
 
 @app.post("/api/topology/layout")
 async def save_topology_layout(payload: TopologyLayoutRequest) -> dict[str, Any]:
+    state.reload()
     result = state.update_device_layouts(
         {device_id: point.model_dump() for device_id, point in payload.layouts.items()}
     )
@@ -291,6 +195,7 @@ async def save_topology_layout(payload: TopologyLayoutRequest) -> dict[str, Any]
 
 @app.post("/api/mac-labels")
 async def save_mac_label(payload: MacLabelRequest) -> dict[str, Any]:
+    state.reload()
     try:
         result = state.update_mac_label(payload.mac, payload.name, payload.description)
     except ValueError as exc:
@@ -301,6 +206,7 @@ async def save_mac_label(payload: MacLabelRequest) -> dict[str, Any]:
 
 @app.post("/api/device-labels")
 async def save_device_label(payload: DeviceLabelRequest) -> dict[str, Any]:
+    state.reload()
     try:
         result = state.update_device_label(payload.device_id, payload.name, payload.description)
     except ValueError as exc:
@@ -311,6 +217,7 @@ async def save_device_label(payload: DeviceLabelRequest) -> dict[str, Any]:
 
 @app.post("/api/live/clear")
 async def clear_live_inventory() -> dict[str, Any]:
+    state.reload()
     seed_configs.clear()
     result = state.clear_live_inventory()
     await publish({"type": "live.cleared", "event": result["event"]})
@@ -319,6 +226,7 @@ async def clear_live_inventory() -> dict[str, Any]:
 
 @app.post("/api/live/seed")
 async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
+    state.reload()
     if seed.version == "2c" and not seed.community:
         raise HTTPException(status_code=400, detail="SNMPv2c community is required")
     if seed.version == "3" and not seed.username:
@@ -345,8 +253,6 @@ async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
     state.register_seed_credentials(seed_credentials_record(config))
     state.register_live_seed(seed_metadata(config, discovery))
     result = state.import_live_discovery(discovery, key)
-    if state.settings.get("polling", {}).get("backend_auto_poll"):
-        start_scheduler()
     await publish({"type": "live.seed.imported", "event": result["event"]})
     return {
         "seed": state.seeds,
@@ -359,6 +265,7 @@ async def add_live_seed(seed: SnmpSeedRequest) -> dict[str, Any]:
 
 @app.post("/api/alerts/{alert_id}/ack")
 async def acknowledge_alert(alert_id: str) -> dict[str, Any]:
+    state.reload()
     result = state.update_alert(alert_id, "ack")
     if result is None:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -368,6 +275,7 @@ async def acknowledge_alert(alert_id: str) -> dict[str, Any]:
 
 @app.post("/api/alerts/{alert_id}/resolve")
 async def resolve_alert(alert_id: str) -> dict[str, Any]:
+    state.reload()
     result = state.update_alert(alert_id, "resolve")
     if result is None:
         raise HTTPException(status_code=404, detail="Alert not found")
