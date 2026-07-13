@@ -4,7 +4,7 @@ Data: 2026-06-04
 
 ## 1. Fonti analizzate
 
-- `claude.md`: piano funzionale e tecnico iniziale.
+- `00_infos/details/original-plan.md`: piano funzionale e tecnico iniziale archiviato.
 - `network_monitor_architecture.svg`: diagramma applicativo a tre layer.
 - Documentazione ufficiale FS consultata per validare il realismo di SNMP/LLDP su switch FS:
   - https://resource.fs.com/mall/file/user_manual/n-series-switches-fsos-configuration-guide.pdf
