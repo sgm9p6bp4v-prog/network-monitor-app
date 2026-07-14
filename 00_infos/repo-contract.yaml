@@ -1,0 +1,75 @@
+contract_version: "2.0"
+
+repo:
+  name: "client--francesco-network-monitor"
+  description: "NetWatch Light: lokaler FastAPI/SNMP-Netzwerkmonitor als begrenzter MVP und Architektur-Prototyp"
+  suite: "client"
+  status: "active"
+
+type:
+  primary: "webapp"
+  tags: [network-monitoring, snmp, fastapi, prototype]
+
+stack:
+  languages: [python, javascript, html, css]
+  runtime: "python"
+  runtime_version: ">=3.11"
+  framework: "fastapi"
+  package_manager: "pip"
+  database: "filesystem-json"
+  test_framework: null
+
+paths:
+  source: "netwatch_light/"
+  tests: null
+  docs: "00_infos/"
+  context: "00_infos/llm-context.md"
+  holds: null
+  entrypoint: "netwatch_light/main.py"
+
+commands:
+  dev: "scripts/run_light_app.sh"
+  build: null
+  test: null
+  lint: null
+  smoke: "curl -sf http://127.0.0.1:5173/api/health"
+
+deployment:
+  deployed: false
+  mode: "local-only"
+  domain: null
+  health_path: "/api/health"
+  ci:
+    platform: "none"
+    auto_deploy: false
+    deploy_branches: []
+
+lifecycle:
+  state: "experiment"
+  kill_date: null
+  owner: "christoph@varga.media"
+  last_review: "2026-07-13"
+
+operational:
+  auth_boundary: "none"
+  data_store: "filesystem"
+  backup_class: "none"
+  host: "none"
+
+env:
+  required: []
+  optional: []
+
+depends_on:
+  services: []
+  repos: []
+
+documentation:
+  standard_version: "1.0"
+  reviewed_paths:
+    - "LIGHT_APP.md"
+    - "TECHNICAL_AUDIT.md"
+    - "netwatch_light/"
+    - "scripts/run_light_app.sh"
+  review_evidence: "00_infos/llm-context.md"
+  runbooks_not_applicable_reason: null

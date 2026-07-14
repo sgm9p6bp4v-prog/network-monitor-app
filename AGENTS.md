@@ -3,9 +3,6 @@
 
 > Source: llm-context.md (hash: 7e8ccefe2a19)
 
-## Global Rules
-@~/.claude/CLAUDE.md
-
 ## Sprint-Infrastruktur (dieses Repo)
 
 Dieses Repo liefert die Sprint-Orchestrierung fuer LARGE Tasks und Multi-Session-Arbeit.
@@ -502,28 +499,3 @@ Bereits beim Anlegen eines HOLDs das `verify_command:` Feld definieren — der C
 | **Domain** | N/A |
 | **Stack** | Languages: python, javascript, html, css | Framework: fastapi | DB: filesystem-json |
 | **Type** | webapp |
-
-## Purpose
-
-NetWatch Light ist der lauffaehige, bewusst begrenzte MVP fuer einen lokalen
-SNMP-Netzwerkmonitor. Er visualisiert Inventar, Interface-Zustaende,
-LLDP-Topologie, Alerts und Events. `TECHNICAL_AUDIT.md` beschreibt die spaetere
-Zielarchitektur; es ist nicht die Beschreibung des heutigen Runtime-Standes.
-
-## Architecture
-
-Der aktuelle Stand ist eine einzelne FastAPI-Anwendung:
-
-```text
-Browser UI in web/
-  -> REST /api/* und WebSocket /ws/events
-  -> netwatch_light.main
-  -> NetWatchState
-  -> data/netwatch_state.json
-  -> optionaler Live-SNMP-Adapter netwatch_light.snmp_live
-```
-
-Mock-Inventar und echte SNMP-Seeds teilen denselben State. Polling laeuft im
-Light-Build als Task im FastAPI-Prozess. Redis/arq, PostgreSQL/TimescaleDB,
-Alembic und verschluesselte Credential-Ablage gehoeren zur Zielarchitektur und
-sind noch nicht implementiert.
