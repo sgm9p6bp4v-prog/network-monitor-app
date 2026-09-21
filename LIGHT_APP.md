@@ -116,3 +116,14 @@ Run the automated backend tests:
 ```bash
 .venv/bin/python -m pytest
 ```
+
+Run the presentation scroll regression tests with Node.js (no npm dependencies):
+
+```bash
+node --test tests/test_presentation_scroll.mjs
+```
+
+Wheel scrolling follows the input distance, brakes at each section, and holds there
+until further wheel input releases it (about three standard wheel steps). Reverse
+input releases the hold immediately. Touch, keyboard and reduced-motion navigation
+use native scrolling; cards, the device grid and overlays keep their own scrolling.

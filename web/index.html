@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NetWatch Light</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=phase5-ops-1" />
+    <link rel="stylesheet" href="/assets/styles.css?v=particle-orb-1" />
   </head>
   <body class="presentation-mode is-home">
     <div class="presentation-shell" id="presentationShell">
@@ -30,7 +30,7 @@
       </section>
 
       <section class="map-showcase" id="topologyShowcase" aria-label="Network topology map">
-        <canvas class="dot-tunnel-canvas" id="dotTunnelCanvas" aria-hidden="true"></canvas>
+        <canvas class="particle-orb-canvas" id="particleOrbCanvas" aria-hidden="true"></canvas>
         <div class="showcase-map-controls" aria-label="Map zoom controls">
           <button class="showcase-zoom-button" type="button" id="showcaseZoomIn" aria-label="Zoom in map">+</button>
           <button class="showcase-zoom-button" type="button" id="showcaseZoomOut" aria-label="Zoom out map">-</button>
@@ -45,7 +45,7 @@
       </section>
 
       <section class="pattern-break" id="patternBreak" aria-label="Pattern transition">
-        <img src="/assets/media/sarah-morris-2.png" alt="" />
+        <img alt="" decoding="async" />
       </section>
 
       <section class="dashboard-showcase" id="presentationDashboard" aria-label="Network dashboard">
@@ -203,6 +203,6 @@
     <span id="backendState" hidden>Connecting</span>
     <span id="eventStreamState" hidden>WebSocket pending</span>
 
-    <script src="/assets/app.js?v=phase5-ops-1" defer></script>
+    <script src="/assets/app.js?v=particle-orb-1" type="module"></script>
   </body>
 </html>

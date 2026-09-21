@@ -1029,6 +1029,16 @@ class NetWatchState:
             candidate["last_seen"] = now_iso()
             self._apply_device_label_to_device(candidate)
             self._apply_mac_label_to_device(candidate)
+            persisted_management_link = self._persisted_management_port_link(
+                device["id"], local_port=candidate.get("observed_local_port")
+            )
+            if (
+                str(candidate.get("observed_source") or "").upper() == "PORT-DESCRIPTION"
+                and persisted_management_link
+                and persisted_management_link.get("to") in devices_by_id
+            ):
+                candidate_remap[candidate["id"]] = str(persisted_management_link["to"])
+                continue
             infrastructure_match_ids = (
                 set()
                 if candidate.get("device_type") == "segment"
@@ -1234,6 +1244,9 @@ class NetWatchState:
             if existing.get("layout"):
                 device["layout"] = existing["layout"]
             device["alerting_enabled"] = existing.get("alerting_enabled", device.get("alerting_enabled", True))
+            if existing.get("management_mac") and not device.get("management_mac"):
+                device["management_mac"] = existing["management_mac"]
+                device["management_mac_source"] = existing.get("management_mac_source") or "persisted"
         devices_by_id[device["id"]] = device
 
     def _is_infrastructure_device(self, device: dict[str, Any]) -> bool:
@@ -1250,7 +1263,13 @@ class NetWatchState:
         for device in devices_by_id.values():
             if not self._is_infrastructure_device(device):
                 continue
-            for value in (device.get("mac"), device.get("observed_mac"), device.get("fingerprint"), device.get("chassis_id")):
+            for value in (
+                device.get("mac"),
+                device.get("observed_mac"),
+                device.get("management_mac"),
+                device.get("fingerprint"),
+                device.get("chassis_id"),
+            ):
                 key = self._mac_label_key(value)
                 if key:
                     index.setdefault(key, device["id"])
@@ -1458,6 +1477,8 @@ class NetWatchState:
     def _link_directness(self, link: dict[str, Any], sources: list[dict[str, Any]], confidence: int) -> str:
         source_names = {str(source.get("source") or "") for source in sources}
         directions = {str(source.get("direction") or "") for source in sources}
+        if "arp" in source_names and "management" in directions:
+            return "management"
         if "lldp" in source_names and "both" in directions:
             return "direct"
         if "lldp" in source_names and confidence >= 80:
@@ -1481,6 +1502,8 @@ class NetWatchState:
             return "Displayed as probable direct link: one-sided LLDP matched an imported SNMP seed."
         if directness == "candidate":
             return "Displayed as candidate link: one-sided LLDP has no reciprocal confirmation yet."
+        if directness == "management":
+            return "Displayed as management link: ARP identifies the seed management interface observed in the MAC table."
         if directness == "observed-fdb":
             return f"Displayed as observed link: MAC table evidence with {confidence}% confidence."
         if directness == "shared-segment":
@@ -1569,8 +1592,26 @@ class NetWatchState:
             link["to"] = remap.get(old_to, link.get("to"))
             if old_to in remap_to_interface:
                 link["to_interface"] = remap_to_interface[old_to]
+                if str(remap_to_interface[old_to]).endswith("-management"):
+                    resolved = devices_by_id.get(old_to, {})
+                    management_mac = self._format_mac_key(
+                        self._mac_label_key(
+                            resolved.get("management_mac")
+                            or resolved.get("mac")
+                            or resolved.get("chassis_id")
+                            or resolved.get("fingerprint")
+                        )
+                    )
+                    if management_mac:
+                        link["management_mac"] = management_mac
+                        observed_source = str(resolved.get("observed_source") or "MAC table")
+                        if "mac table" not in str(link.get("evidence") or "").lower():
+                            link["evidence"] = (
+                                f"MAC table {observed_source}; {link.get('evidence') or 'endpoint observation'}"
+                            )
             if link.get("from") == link.get("to"):
                 continue
+            self._classify_management_link(link, devices_by_id)
             link["id"] = self._stable_link_id(link)
             merged_links[link["id"]] = {**merged_links.get(link["id"], {}), **link}
         self.links = list(merged_links.values())
@@ -1597,6 +1638,7 @@ class NetWatchState:
                 pending.get("chassis_id"),
                 pending.get("mac"),
                 pending.get("observed_mac"),
+                pending.get("management_mac"),
             )
         }
         pending_identifiers.discard("")
@@ -1625,6 +1667,7 @@ class NetWatchState:
                     device.get("chassis_id"),
                     device.get("mac"),
                     device.get("observed_mac"),
+                    device.get("management_mac"),
                 )
             }
             device_identifiers.update(
@@ -1682,6 +1725,9 @@ class NetWatchState:
         if not device:
             return ""
         endpoint_macs = set(self._device_mac_label_keys(endpoint))
+        management_key = self._mac_label_key(device.get("management_mac"))
+        if management_key and management_key in endpoint_macs:
+            return f"{device.get('id')}-management"
         for interface in device.get("interfaces", []) or []:
             interface_key = self._mac_label_key(interface.get("if_phys_address"))
             if interface_key and interface_key in endpoint_macs:
@@ -1849,7 +1895,7 @@ class NetWatchState:
         return True
 
     def _observed_infrastructure_link_mac_key(self, target: dict[str, Any], link: dict[str, Any]) -> str:
-        remote_key = self._mac_label_key(link.get("remote_port"))
+        remote_key = self._mac_label_key(link.get("management_mac") or link.get("remote_port"))
         if not remote_key:
             return ""
         if remote_key not in self._infrastructure_device_mac_keys(target):
@@ -1992,13 +2038,7 @@ class NetWatchState:
                     continue
                 device_fp = self._normalize_identifier(device.get("fingerprint"))
                 device_chassis = self._normalize_identifier(device.get("chassis_id"))
-                interface_ids = {
-                    self._normalize_identifier(interface.get("if_phys_address"))
-                    for interface in device.get("interfaces", [])
-                    if interface.get("if_phys_address")
-                }
-                device_mac = self._normalize_identifier(device.get("mac") or device.get("observed_mac"))
-                if candidate_mac and (candidate_mac == device_mac or candidate_mac in interface_ids):
+                if self._mac_label_key(candidate_mac) in self._infrastructure_device_mac_keys(device):
                     return device_id
                 if candidate_fp and device_fp and candidate_fp == device_fp:
                     return device_id
@@ -2029,7 +2069,11 @@ class NetWatchState:
                 return device_id
             if candidate_chassis and candidate_chassis in interface_ids:
                 return device_id
-            if candidate_mac and (candidate_mac == device_mac or candidate_mac in interface_ids):
+            if candidate_mac and (
+                candidate_mac == device_mac
+                or candidate_mac in interface_ids
+                or self._mac_label_key(candidate_mac) in self._infrastructure_device_mac_keys(device)
+            ):
                 return device_id
         return None
 
@@ -2040,7 +2084,8 @@ class NetWatchState:
         device_ip = str(device.get("ip") or "").strip()
         device_fp = self._normalize_identifier(device.get("fingerprint"))
         device_chassis = self._normalize_identifier(device.get("chassis_id"))
-        device_identifiers = {device_fp, device_chassis}
+        device_management_mac = self._normalize_identifier(device.get("management_mac"))
+        device_identifiers = {device_fp, device_chassis, device_management_mac}
         device_identifiers.update(
             self._normalize_identifier(interface.get("if_phys_address"))
             for interface in device.get("interfaces", [])
@@ -2133,6 +2178,7 @@ class NetWatchState:
             device.get("asset_mac"),
             device.get("mac"),
             device.get("observed_mac"),
+            device.get("management_mac"),
             device.get("chassis_id"),
             device.get("fingerprint"),
         ):
@@ -2195,6 +2241,7 @@ class NetWatchState:
             link["to"] = candidate_remap.get(link["to"], link["to"])
             if link.get("from") == link.get("to"):
                 continue
+            self._classify_management_link(link, devices_by_id)
             link["id"] = self._stable_link_id(link)
             merged[link["id"]] = link
         for raw_link in links:
@@ -2203,16 +2250,94 @@ class NetWatchState:
             link["to"] = candidate_remap.get(link["to"], link["to"])
             if link.get("from") == link.get("to"):
                 continue
+            persisted_management_link = self._persisted_management_port_link(
+                str(link.get("from") or ""),
+                from_interface=link.get("from_interface"),
+                local_port=link.get("local_port"),
+            )
+            if persisted_management_link and link.get("to") == persisted_management_link.get("to"):
+                link["management_mac"] = persisted_management_link.get("management_mac")
+                link["to_interface"] = persisted_management_link.get("to_interface")
+                link["evidence"] = (
+                    f"MAC table persisted management binding; {link.get('evidence') or 'current port observation'}"
+                )
             if seed_key:
                 link["seed_key"] = seed_key
             link["missing_polls"] = 0
             link["stale"] = False
             link["last_seen"] = now_iso()
+            self._classify_management_link(link, devices_by_id)
             link["id"] = self._stable_link_id(link)
             existing = merged.get(link["id"], {})
             merged[link["id"]] = {**existing, **link}
         self.links = list(merged.values())
         self._confirm_reciprocal_links()
+
+    def _persisted_management_port_link(
+        self,
+        from_device_id: str,
+        from_interface: Any = None,
+        local_port: Any = None,
+    ) -> dict[str, Any] | None:
+        interface_id = str(from_interface or "").strip()
+        port_name = str(local_port or "").strip().lower()
+        if not from_device_id or (not interface_id and not port_name):
+            return None
+        for link in self.links:
+            if link.get("link_type") != "management" or link.get("from") != from_device_id:
+                continue
+            if interface_id and str(link.get("from_interface") or "").strip() == interface_id:
+                return link
+            if port_name and str(link.get("local_port") or "").strip().lower() == port_name:
+                return link
+        return None
+
+    def _classify_management_link(
+        self, link: dict[str, Any], devices_by_id: dict[str, dict[str, Any]]
+    ) -> bool:
+        if "mac table" not in str(link.get("evidence") or "").lower():
+            return False
+        target = devices_by_id.get(link.get("to"))
+        if not target or not self._is_infrastructure_device(target):
+            return False
+        remote_key = self._mac_label_key(link.get("management_mac") or link.get("remote_port"))
+        management_key = self._mac_label_key(target.get("management_mac"))
+        if not remote_key or remote_key != management_key:
+            return False
+        if link.get("link_type") == "management":
+            return False
+
+        original_evidence = str(link.get("evidence") or "MAC table")
+        observed_at = str(link.get("last_seen") or now_iso())
+        link["link_type"] = "management"
+        link["management_mac"] = self._format_mac_key(management_key)
+        link["status"] = "observed"
+        link["to_interface"] = f"{target.get('id')}-management"
+        link["remote_port"] = f"management {target.get('ip') or self._format_mac_key(management_key)}"
+        link["evidence"] = f"Management ARP + {original_evidence}"
+        link["evidence_sources"] = [
+            {
+                "source": "arp",
+                "direction": "management",
+                "weight": 78,
+                "detail": (
+                    f"Seed management IP {target.get('ip') or 'unknown'} resolves to "
+                    f"{target.get('management_mac')}"
+                ),
+                "observed_at": observed_at,
+            },
+            {
+                "source": "fdb",
+                "direction": "observed",
+                "weight": 52 if "q-bridge" in original_evidence.lower() else 44,
+                "detail": original_evidence,
+                "observed_at": observed_at,
+            },
+        ]
+        link["topology_decision"] = (
+            "Displayed as management link: the FDB MAC matches the ARP identity of an imported seed."
+        )
+        return True
 
     def _is_sticky_observed_infrastructure_mac_link(
         self, link: dict[str, Any], devices_by_id: dict[str, dict[str, Any]]

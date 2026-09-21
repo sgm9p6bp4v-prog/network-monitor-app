@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from ipaddress import ip_address
+from pathlib import Path
+import re
+import shutil
+import sys
 from typing import Any
 from uuid import uuid5, NAMESPACE_DNS
 
@@ -65,6 +70,21 @@ LLDP_LOCAL_OIDS = {
     "local_port_desc": "1.0.8802.1.1.2.1.3.7.1.4",
 }
 
+FS_ENTERPRISE_OID = "1.3.6.1.4.1.52642"
+FS_LLDP_OID = f"{FS_ENTERPRISE_OID}.127"
+FS_LLDP_OIDS = {
+    name: oid.replace("1.0.8802.1.1.2", FS_LLDP_OID)
+    for name, oid in LLDP_OIDS.items()
+}
+FS_LLDP_LOCAL_OIDS = {
+    name: oid.replace("1.0.8802.1.1.2", FS_LLDP_OID)
+    for name, oid in LLDP_LOCAL_OIDS.items()
+}
+FS_LLDP_REMOTE_MGMT_OIDS = {
+    # FS stores the address as an OctetString value indexed like the remote row.
+    "remote_mgmt_address": f"{FS_LLDP_OID}.1.4.2.1.2",
+}
+
 BRIDGE_OIDS = {
     "base_port_if_index": "1.3.6.1.2.1.17.1.4.1.2",
     "fdb_port": "1.3.6.1.2.1.17.4.3.1.2",
@@ -97,6 +117,7 @@ OPER_STATUS = {
 }
 MAX_ENDPOINT_MACS_PER_PORT = 8
 MULTI_MAC_SEGMENT_THRESHOLD = 1
+NEIGHBOR_MAC_PATTERN = re.compile(r"(?<![0-9a-fA-F])(?:[0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}(?![0-9a-fA-F])")
 
 
 @dataclass
@@ -159,6 +180,54 @@ def _normalize_mac(value: Any) -> str:
     compact = "".join(char for char in text if char in "0123456789abcdef")
     if len(compact) == 12:
         return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+    return ""
+
+
+def _neighbor_mac_from_text(value: str) -> str:
+    for candidate in NEIGHBOR_MAC_PATTERN.findall(value or ""):
+        mac = _normalize_mac(candidate)
+        if _is_usable_endpoint_mac(mac):
+            return mac
+    return ""
+
+
+async def _resolve_management_mac(host: str) -> str:
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return ""
+    if address.version != 4:
+        return ""
+
+    if sys.platform == "darwin":
+        commands = [("arp", "-n", host)]
+    elif sys.platform.startswith("linux"):
+        commands = [("ip", "neigh", "show", host), ("arp", "-n", host)]
+    elif sys.platform.startswith("win"):
+        commands = [("arp", "-a", host)]
+    else:
+        commands = [("arp", "-n", host)]
+
+    for command in commands:
+        executable = shutil.which(command[0])
+        if not executable:
+            fallback = Path("/usr/sbin") / command[0]
+            if not fallback.exists():
+                continue
+            executable = str(fallback)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                *command[1:],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=1.5)
+        except (OSError, asyncio.TimeoutError):
+            continue
+        mac = _neighbor_mac_from_text(stdout.decode("utf-8", errors="ignore"))
+        if process.returncode == 0 and mac:
+            return mac
     return ""
 
 
@@ -378,6 +447,59 @@ def _lldp_management_addresses(rows: dict[str, Any]) -> dict[str, str]:
     return addresses
 
 
+def _fs_lldp_management_addresses(rows: dict[str, Any]) -> dict[str, str]:
+    addresses: dict[str, str] = {}
+    for remote_index, raw_address in rows.items():
+        address = _text(raw_address).strip()
+        octets = address.split(".")
+        if len(octets) != 4:
+            continue
+        values = [_int(part, -1) for part in octets]
+        if any(value < 0 or value > 255 for value in values) or all(value == 0 for value in values):
+            continue
+        addresses.setdefault(remote_index, ".".join(str(value) for value in values))
+    return addresses
+
+
+def _has_lldp_remote_rows(tables: dict[str, dict[str, Any]]) -> bool:
+    return any(tables.get(name) for name in LLDP_OIDS)
+
+
+def _select_lldp_remote_indexes(
+    lldp: dict[str, dict[str, Any]],
+    remote_mgmt_ips: dict[str, str],
+    oid_profile: str,
+    fdb_rows: list[dict[str, str]],
+) -> tuple[list[str], list[str]]:
+    indexes = sorted(
+        set(lldp["remote_chassis_id"])
+        | set(lldp["remote_port_id"])
+        | set(lldp["remote_port_desc"])
+        | set(lldp["remote_sys_name"])
+        | set(lldp["remote_sys_desc"]),
+        key=lambda item: [int(part) if part.isdigit() else part for part in item.split(".")],
+    )
+    if oid_profile != "fs-private":
+        return indexes, []
+
+    fdb_locations = {(row["mac"], row["if_index"]) for row in fdb_rows}
+    accepted: list[str] = []
+    suppressed: list[str] = []
+    for index in indexes:
+        has_identity = bool(
+            _text(lldp["remote_sys_name"].get(index)).strip()
+            or _text(lldp["remote_sys_desc"].get(index)).strip()
+            or remote_mgmt_ips.get(index)
+        )
+        chassis_mac = _normalize_mac(_lldp_id_text(lldp["remote_chassis_id"].get(index)))
+        local_port_num = _lldp_local_port_num(index)
+        if has_identity or (chassis_mac and (chassis_mac, local_port_num) in fdb_locations):
+            accepted.append(index)
+        else:
+            suppressed.append(index)
+    return accepted, suppressed
+
+
 def _arp_ip_by_mac(arp: dict[str, dict[str, Any]]) -> dict[str, str]:
     addresses: dict[str, str] = {}
     for index, raw_mac in arp["ip_net_to_media_phys_address"].items():
@@ -568,6 +690,19 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
     sys_name = system.get("sys_name") or config.host
     sys_descr = system.get("sys_descr") or "SNMP device"
     sys_object_id = system.get("sys_object_id") or "unknown"
+    management_mac = await _resolve_management_mac(config.host)
+    lldp_oid_profile = "standard"
+    if sys_object_id.startswith(FS_ENTERPRISE_OID) and not _has_lldp_remote_rows(lldp):
+        fs_lldp, fs_local_lldp, fs_remote_mgmt = await asyncio.gather(
+            _walk_many(config, FS_LLDP_OIDS),
+            _walk_many(config, FS_LLDP_LOCAL_OIDS),
+            _walk_many_optional(config, FS_LLDP_REMOTE_MGMT_OIDS),
+        )
+        if _has_lldp_remote_rows(fs_lldp) or any(fs_local_lldp.values()):
+            lldp = fs_lldp
+            local_lldp = fs_local_lldp
+            remote_mgmt = fs_remote_mgmt
+            lldp_oid_profile = "fs-private"
     device_id = _device_id(config.host, sys_name, sys_object_id)
 
     indexes = sorted(
@@ -611,17 +746,26 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
 
     candidates = []
     candidate_links = []
-    remote_mgmt_ips = _lldp_management_addresses(remote_mgmt["remote_mgmt_if_subtype"])
-    remote_indexes = sorted(
-        set(lldp["remote_chassis_id"])
-        | set(lldp["remote_port_id"])
-        | set(lldp["remote_port_desc"])
-        | set(lldp["remote_sys_name"])
-        | set(lldp["remote_sys_desc"]),
-        key=lambda item: [int(part) if part.isdigit() else part for part in item.split(".")],
+    bridge_port_to_if_index = {
+        str(_int(port)): str(_int(raw_if_index))
+        for port, raw_if_index in bridge["base_port_if_index"].items()
+        if _int(port) > 0 and _int(raw_if_index) > 0
+    }
+    endpoint_rows = _fdb_rows(bridge, q_bridge, bridge_port_to_if_index)
+    if lldp_oid_profile == "fs-private":
+        remote_mgmt_rows = remote_mgmt["remote_mgmt_address"]
+        remote_mgmt_ips = _fs_lldp_management_addresses(remote_mgmt_rows)
+    else:
+        remote_mgmt_rows = remote_mgmt["remote_mgmt_if_subtype"]
+        remote_mgmt_ips = _lldp_management_addresses(remote_mgmt_rows)
+    remote_indexes, suppressed_remote_indexes = _select_lldp_remote_indexes(
+        lldp,
+        remote_mgmt_ips,
+        lldp_oid_profile,
+        endpoint_rows,
     )
     for index in remote_indexes:
-        remote_chassis_id = _octets_text(lldp["remote_chassis_id"].get(index))
+        remote_chassis_id = _lldp_id_text(lldp["remote_chassis_id"].get(index))
         remote_sys_name = _text(lldp["remote_sys_name"].get(index)).strip()
         remote_sys_desc = _text(lldp["remote_sys_desc"].get(index)).strip()
         remote_mgmt_ip = remote_mgmt_ips.get(index, "")
@@ -703,17 +847,11 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
     }
     known_macs.update(_normalize_mac(candidate.get("chassis_id")) for candidate in candidates)
     known_macs.discard("")
-    bridge_port_to_if_index = {
-        str(_int(port)): str(_int(raw_if_index))
-        for port, raw_if_index in bridge["base_port_if_index"].items()
-        if _int(port) > 0 and _int(raw_if_index) > 0
-    }
     vlan_config_by_if_index = _vlan_config_by_if_index(q_bridge, bridge_port_to_if_index)
     for if_index, vlan_config in vlan_config_by_if_index.items():
         if if_index in interface_by_index:
             interface_by_index[if_index].update(vlan_config)
     ip_by_mac = _arp_ip_by_mac(arp)
-    endpoint_rows = _fdb_rows(bridge, q_bridge, bridge_port_to_if_index)
     endpoint_rows.sort(key=lambda row: [int(part) if part.isdigit() else part for part in row["if_index"].split(".")] + [row["mac"]])
     fdb_macs_by_if_index: dict[str, set[str]] = {}
     fdb_rows_by_if_index: dict[str, list[dict[str, str]]] = {}
@@ -976,6 +1114,8 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
         "model": sys_descr.splitlines()[0][:80],
         "status": "up",
         "fingerprint": f"uuid+{sys_object_id}+{sys_name}",
+        "management_mac": management_mac,
+        "management_mac_source": "local-arp" if management_mac else "",
         "alerting_enabled": True,
         "layout": {"x": 240, "y": 180, "locked": True, "source": "manual"},
         "interfaces": interfaces,
@@ -993,7 +1133,10 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
             "if_oper_status_rows": len(tables["if_oper_status"]),
             "lldp_remote_sys_name_rows": len(lldp["remote_sys_name"]),
             "lldp_remote_rows": len(remote_indexes),
-            "lldp_remote_mgmt_rows": len(remote_mgmt["remote_mgmt_if_subtype"]),
+            "lldp_remote_rows_raw": len(remote_indexes) + len(suppressed_remote_indexes),
+            "lldp_remote_rows_suppressed": len(suppressed_remote_indexes),
+            "lldp_oid_profile": lldp_oid_profile,
+            "lldp_remote_mgmt_rows": len(remote_mgmt_rows),
             "lldp_remote_mgmt_ips": len(remote_mgmt_ips),
             "lldp_local_port_rows": len(local_lldp["local_port_id"]),
             "bridge_fdb_rows": len(bridge["fdb_port"]),
@@ -1002,6 +1145,7 @@ async def discover_seed(config: SnmpSeedConfig, labeled_macs: set[str] | None = 
             "q_bridge_vlan_rows": len(q_bridge["q_vlan_static_name"]),
             "q_bridge_vlan_ports": len(vlan_config_by_if_index),
             "arp_rows": len(arp["ip_net_to_media_phys_address"]),
+            "management_mac_resolved": bool(management_mac),
             "mac_endpoints": endpoint_count,
             "shared_segments": segment_count,
             "described_endpoints": described_endpoint_count,

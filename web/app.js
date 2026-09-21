@@ -1,3 +1,5 @@
+import { PresentationScroll, wheelPixels } from "./presentation-scroll.mjs";
+
 const appState = {
   selectedView: "home",
   selectedDeviceId: "core-01",
@@ -17,7 +19,7 @@ const appState = {
   historyDeviceId: "",
   historyOverlayOpen: false,
   deviceHistory: null,
-  tunnelAnimation: null,
+  particleAnimation: null,
   snapshot: {
     devices: [],
     links: [],
@@ -41,16 +43,69 @@ const viewMeta = {
 };
 
 const landingRgb = [216, 211, 235];
-const mapRgb = [252, 252, 239];
+const mapRgb = [249, 250, 238];
 const dashboardRgb = [217, 217, 217];
+const patternBreakImages = [
+  "sarah-morris-1.png",
+  "sarah-morris-2.png",
+  "sarah-morris-3.png",
+  "sarah-morris-4.png",
+  "sarah-morris-5.png"
+];
 const patternSectionRatio = 1 / 3;
 const presentationScrollDurationMs = 2000;
-const presentationScrollSettleMs = 260;
-const presentationScrollHold = {
-  lockedUntil: 0,
-  targetName: "",
-  frame: 0
+const presentationScroll = new PresentationScroll();
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+let presentationScrollFrame = 0;
+let presentationWrittenTop = window.scrollY;
+let presentationVisualFrame = 0;
+let presentationLayout = null;
+let updateParticleVisibility = () => {};
+const presentationStyleValues = new WeakMap();
+const presentationParts = {
+  shell: document.getElementById("presentationShell"),
+  copy: document.querySelector(".landing-copy"),
+  credit: document.querySelector(".landing-credit"),
+  code: document.querySelector(".landing-code"),
+  pattern: document.querySelector(".landing-pattern"),
+  particles: document.getElementById("particleOrbCanvas"),
+  map: document.getElementById("showcaseMap"),
+  mapControls: document.querySelector(".showcase-map-controls"),
+  evidence: document.getElementById("topologyEvidencePanel"),
+  patternBreak: document.querySelector(".pattern-break img"),
+  live: document.querySelector(".dashboard-live"),
+  actions: document.querySelector(".dashboard-action-row"),
+  summary: document.getElementById("presentationSeedSummary"),
+  ops: document.getElementById("dashboardOpsGrid"),
+  cards: document.getElementById("presentationDashboardCards"),
+  deviceHeader: document.querySelector(".devices-showcase-header"),
+  deviceToggle: document.querySelector(".devices-view-toggle"),
+  carousel: document.getElementById("devicesCarousel"),
+  carouselControls: document.querySelector(".devices-carousel-controls")
 };
+
+function selectPatternBreakImage() {
+  const image = presentationParts.patternBreak;
+  if (!image) return;
+
+  let previous = "";
+  try {
+    previous = window.sessionStorage.getItem("netwatch-pattern-break-image") || "";
+  } catch {
+    // Storage can be unavailable in private browsing; random selection still works.
+  }
+
+  const candidates = patternBreakImages.filter((name) => name !== previous);
+  const selected = candidates[Math.floor(Math.random() * candidates.length)];
+  image.src = `/assets/media/${selected}`;
+  image.dataset.variant = selected;
+
+  try {
+    window.sessionStorage.setItem("netwatch-pattern-break-image", selected);
+  } catch {
+    // Keep the selected image even when session storage is unavailable.
+  }
+}
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -73,27 +128,61 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function getPresentationMetrics() {
+function getPresentationLayout() {
+  if (presentationLayout) return presentationLayout;
   const viewport = Math.max(1, window.innerHeight);
+  const topologyTop = document.getElementById("topologyShowcase")?.offsetTop || viewport;
+  const patternTop = document.getElementById("patternBreak")?.offsetTop || viewport * 2;
+  const dashboardTop = document.getElementById("presentationDashboard")?.offsetTop || viewport * (2 + patternSectionRatio);
+  const devicesTop = document.getElementById("presentationDevices")?.offsetTop || dashboardTop + viewport;
+  presentationLayout = {
+    viewport, topologyTop, patternTop, dashboardTop, devicesTop,
+    maxScroll: Math.max(0, document.documentElement.scrollHeight - viewport)
+  };
+  return presentationLayout;
+}
+
+function getPresentationMetrics() {
+  const { viewport, topologyTop, patternTop, dashboardTop, devicesTop } = getPresentationLayout();
   const scroll = window.scrollY;
-  const dashboardStart = 2 + patternSectionRatio;
-  const devicesStart = dashboardStart + 1;
+  const dashboardStart = dashboardTop / viewport;
+  const devicesStart = devicesTop / viewport;
   return {
     viewport,
     scroll,
     dashboardStart,
     devicesStart,
-    landingProgress: clamp(scroll / viewport, 0, 1),
-    postTopologyProgress: clamp((scroll - viewport) / viewport, 0, 1),
-    patternProgress: clamp((scroll - viewport) / (viewport * (1 + patternSectionRatio)), 0, 1),
+    landingProgress: clamp(scroll / topologyTop, 0, 1),
+    postTopologyProgress: clamp((scroll - topologyTop) / Math.max(1, patternTop - topologyTop), 0, 1),
+    patternProgress: clamp((scroll - topologyTop) / Math.max(1, dashboardTop - topologyTop), 0, 1),
     dashboardProgress: clamp((scroll - viewport * (dashboardStart - 0.28)) / (viewport * 0.28), 0, 1),
-    dashboardBgProgress: clamp((scroll - viewport * 2) / (viewport * patternSectionRatio), 0, 1),
+    dashboardBgProgress: clamp((scroll - patternTop) / Math.max(1, dashboardTop - patternTop), 0, 1),
     devicesProgress: clamp((scroll - viewport * (devicesStart - 0.34)) / (viewport * 0.34), 0, 1)
   };
 }
 
+function setPresentationStyle(element, property, value) {
+  if (!element) return;
+  let values = presentationStyleValues.get(element);
+  if (!values) {
+    values = new Map();
+    presentationStyleValues.set(element, values);
+  }
+  if (values.get(property) === value) return;
+  values.set(property, value);
+  element.style.setProperty(property, value);
+}
+
+function schedulePresentationProgress() {
+  if (presentationVisualFrame) return;
+  presentationVisualFrame = window.requestAnimationFrame(() => {
+    presentationVisualFrame = 0;
+    updatePresentationProgress();
+  });
+}
+
 function updatePresentationProgress() {
-  const shell = document.getElementById("presentationShell");
+  const shell = presentationParts.shell;
   if (!shell || !document.body.classList.contains("presentation-mode")) return;
   const {
     landingProgress,
@@ -113,28 +202,41 @@ function updatePresentationProgress() {
     clamp((landingProgress - 0.18) * 1.45, 0, 1),
     clamp(1 - postTopologyProgress * 1.16, 0, 1)
   );
-  const tunnelOpacity = clamp(landingProgress * 0.72, 0, 0.72) * clamp(1 - postTopologyProgress * 1.15, 0, 1);
+  const particleOpacity = clamp(landingProgress * 0.62, 0, 0.62) * clamp(1 - postTopologyProgress * 1.15, 0, 1);
   const patternOffset = (0.5 - patternProgress) * 92;
 
-  shell.style.setProperty("--transition-progress", landingProgress.toFixed(4));
-  shell.style.setProperty("--post-topology-progress", postTopologyProgress.toFixed(4));
-  shell.style.setProperty("--dashboard-progress", dashboardProgress.toFixed(4));
-  shell.style.setProperty("--devices-progress", devicesProgress.toFixed(4));
-  shell.style.setProperty("--stage-bg-rgb", stageRgb);
-  shell.style.setProperty("--landing-opacity", clamp(1 - landingProgress * 1.65, 0, 1).toFixed(4));
-  shell.style.setProperty("--pattern-opacity", clamp(1 - landingProgress * 1.2, 0, 1).toFixed(4));
+  // Only mutate the animated elements. Inherited root variables invalidate the entire inventory.
+  const parts = presentationParts;
+  const move = (element, opacity, x = 0, y = 0) => {
+    setPresentationStyle(element, "opacity", opacity.toFixed(4));
+    setPresentationStyle(element, "transform", `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`);
+  };
+  setPresentationStyle(shell, "background-color", `rgb(${stageRgb})`);
+  setPresentationStyle(document.body, "background-color", `rgb(${stageRgb})`);
+  const landingOpacity = clamp(1 - landingProgress * 1.65, 0, 1);
+  move(parts.copy, landingOpacity, -landingProgress * 80);
+  move(parts.credit, landingOpacity, -landingProgress * 60);
   const codeOpacity = clamp(1 - postTopologyProgress * 1.2, 0, 1);
-  shell.style.setProperty("--code-opacity", codeOpacity.toFixed(4));
-  shell.style.setProperty("--code-pointer", codeOpacity > 0.08 ? "auto" : "none");
-  shell.style.setProperty("--map-opacity", mapOpacity.toFixed(4));
-  shell.style.setProperty("--tunnel-opacity", tunnelOpacity.toFixed(4));
-  shell.style.setProperty("--pattern-offset", `${patternOffset.toFixed(1)}px`);
-  shell.style.setProperty("--dashboard-live-x", `${((1 - dashboardProgress) * 72).toFixed(1)}px`);
-  shell.style.setProperty("--dashboard-run-x", `${((1 - dashboardProgress) * -86).toFixed(1)}px`);
-  shell.style.setProperty("--dashboard-card-y", `${((1 - dashboardProgress) * 92).toFixed(1)}px`);
-  shell.style.setProperty("--devices-header-y", `${((1 - devicesProgress) * 28).toFixed(1)}px`);
-  shell.style.setProperty("--devices-carousel-y", `${((1 - devicesProgress) * 56).toFixed(1)}px`);
-  document.body.style.setProperty("--stage-bg-rgb", stageRgb);
+  setPresentationStyle(parts.code, "opacity", codeOpacity.toFixed(4));
+  setPresentationStyle(parts.code, "pointer-events", codeOpacity > 0.08 ? "auto" : "none");
+  setPresentationStyle(parts.code, "transform", `translate3d(calc(${landingProgress.toFixed(4)} * var(--pattern-width)), 0, 0)`);
+  setPresentationStyle(parts.pattern, "opacity", clamp(1 - landingProgress * 1.2, 0, 1).toFixed(4));
+  setPresentationStyle(parts.pattern, "transform", `translate3d(${(landingProgress * 38).toFixed(3)}vw, 0, 0)`);
+  move(parts.map, mapOpacity, (1 - landingProgress) * -150);
+  move(parts.mapControls, mapOpacity, (1 - landingProgress) * -90);
+  move(parts.evidence, mapOpacity, (1 - landingProgress) * -90);
+  setPresentationStyle(parts.particles, "opacity", particleOpacity.toFixed(4));
+  updateParticleVisibility(particleOpacity > 0.001 && !document.hidden);
+  setPresentationStyle(parts.patternBreak, "transform", `translate3d(0, ${patternOffset.toFixed(1)}px, 0) scale(1.06)`);
+  move(parts.live, dashboardProgress, (1 - dashboardProgress) * 72);
+  for (const element of [parts.actions, parts.summary, parts.ops]) {
+    move(element, dashboardProgress, (1 - dashboardProgress) * -86);
+  }
+  move(parts.cards, dashboardProgress, 0, (1 - dashboardProgress) * 92);
+  move(parts.deviceHeader, devicesProgress, 0, (1 - devicesProgress) * 28);
+  move(parts.deviceToggle, devicesProgress, 0, (1 - devicesProgress) * 28);
+  move(parts.carousel, devicesProgress, 0, (1 - devicesProgress) * 56);
+  setPresentationStyle(parts.carouselControls, "opacity", devicesProgress.toFixed(4));
   if (scroll >= viewport * (devicesStart - 0.08)) {
     appState.selectedView = "devices";
   } else if (scroll >= viewport * (dashboardStart - 0.08)) {
@@ -168,8 +270,7 @@ function enterPresentationMode(view = "home", behavior = "smooth") {
   if (behavior === "smooth") {
     animatePresentationScrollTo(top);
   } else {
-    window.cancelAnimationFrame(presentationScrollHold.frame);
-    presentationScrollHold.frame = 0;
+    cancelPresentationScroll();
     window.scrollTo({ top, behavior: "auto" });
     window.requestAnimationFrame(updatePresentationProgress);
   }
@@ -181,30 +282,29 @@ function enterPresentationMode(view = "home", behavior = "smooth") {
 }
 
 function enterAppMode(view) {
+  cancelPresentationScroll();
   document.body.classList.remove("presentation-mode", "is-home");
   appState.selectedView = view;
   window.scrollTo({ top: 0, behavior: "auto" });
 }
 
 function getPresentationAnchorTops() {
-  const topologySection = document.getElementById("topologyShowcase");
-  const dashboardSection = document.getElementById("presentationDashboard");
-  const devicesSection = document.getElementById("presentationDevices");
+  const { topologyTop, dashboardTop, devicesTop } = getPresentationLayout();
   return [
     { name: "home", top: 0 },
-    { name: "topology", top: topologySection?.offsetTop ?? window.innerHeight },
-    { name: "dashboard", top: dashboardSection?.offsetTop ?? window.innerHeight * (2 + patternSectionRatio) },
-    { name: "devices", top: devicesSection?.offsetTop ?? window.innerHeight * (3 + patternSectionRatio) }
+    { name: "topology", top: topologyTop },
+    { name: "dashboard", top: dashboardTop },
+    { name: "devices", top: devicesTop }
   ];
 }
 
 function updatePresentationHashForView(view) {
   if (view === "home") {
-    if (window.location.hash) history.pushState(null, "", window.location.pathname + window.location.search);
+    if (window.location.hash) history.replaceState(null, "", window.location.pathname + window.location.search);
     return;
   }
   if (window.location.hash !== `#${view}`) {
-    history.pushState(null, "", `#${view}`);
+    history.replaceState(null, "", `#${view}`);
   }
 }
 
@@ -215,11 +315,11 @@ function easePresentationScroll(progress) {
 }
 
 function animatePresentationScrollTo(top, duration = presentationScrollDurationMs) {
-  window.cancelAnimationFrame(presentationScrollHold.frame);
+  cancelPresentationScroll();
   const startTop = window.scrollY;
   const distance = top - startTop;
 
-  if (Math.abs(distance) < 1 || duration <= 0) {
+  if (Math.abs(distance) < 1 || duration <= 0 || reducedMotion.matches) {
     window.scrollTo({ top, behavior: "auto" });
     updatePresentationProgress();
     return;
@@ -230,29 +330,26 @@ function animatePresentationScrollTo(top, duration = presentationScrollDurationM
     const progress = clamp((now - startTime) / duration, 0, 1);
     const eased = easePresentationScroll(progress);
     window.scrollTo({ top: startTop + distance * eased, behavior: "auto" });
+    presentationWrittenTop = window.scrollY;
     updatePresentationProgress();
     if (progress < 1) {
-      presentationScrollHold.frame = window.requestAnimationFrame(step);
+      presentationScrollFrame = window.requestAnimationFrame(step);
     } else {
       window.scrollTo({ top, behavior: "auto" });
       updatePresentationProgress();
-      presentationScrollHold.frame = 0;
+      presentationScrollFrame = 0;
+      presentationScroll.reset(window.scrollY);
     }
   };
 
-  presentationScrollHold.frame = window.requestAnimationFrame(step);
+  presentationScrollFrame = window.requestAnimationFrame(step);
 }
 
-function resetPresentationScrollHoldIfAwayFromAnchor() {
-  if (!document.body.classList.contains("presentation-mode")) {
-    presentationScrollHold.lockedUntil = 0;
-    presentationScrollHold.targetName = "";
-    return;
-  }
-  if (performance.now() >= presentationScrollHold.lockedUntil) {
-    presentationScrollHold.lockedUntil = 0;
-    presentationScrollHold.targetName = "";
-  }
+function cancelPresentationScroll() {
+  window.cancelAnimationFrame(presentationScrollFrame);
+  presentationScrollFrame = 0;
+  presentationScroll.reset(window.scrollY);
+  presentationWrittenTop = window.scrollY;
 }
 
 function canScrollElementInDirection(element, deltaY) {
@@ -264,72 +361,56 @@ function canScrollElementInDirection(element, deltaY) {
 }
 
 function getInternalScrollTarget(target, deltaY) {
-  if (!(target instanceof Element)) return null;
-  const internal = target.closest(".device-card-scroll, .devices-showcase.is-grid-view .devices-carousel");
-  return canScrollElementInDirection(internal, deltaY) ? internal : null;
+  for (let element = target; element && element !== document.body; element = element.parentElement) {
+    if (/^(auto|scroll)$/.test(getComputedStyle(element).overflowY)
+      && canScrollElementInDirection(element, deltaY)) return element;
+  }
+  return null;
 }
 
-function nearestPresentationAnchorIndex(anchors, current) {
-  let nearest = 0;
-  let distance = Number.POSITIVE_INFINITY;
-  anchors.forEach((anchor, index) => {
-    const nextDistance = Math.abs(anchor.top - current);
-    if (nextDistance < distance) {
-      nearest = index;
-      distance = nextDistance;
+function continuePresentationScroll() {
+  if (presentationScrollFrame) return;
+  let lastTime = performance.now();
+  let position = window.scrollY;
+  const step = (now) => {
+    position = presentationScroll.advance(position, Math.min(now - lastTime, 64), window.innerHeight);
+    lastTime = now;
+    window.scrollTo({ top: position, behavior: "auto" });
+    presentationWrittenTop = window.scrollY;
+    updatePresentationProgress();
+    if (position !== presentationScroll.target) {
+      presentationScrollFrame = window.requestAnimationFrame(step);
+    } else {
+      presentationScrollFrame = 0;
+      const anchor = getPresentationAnchorTops().find((item) => Math.abs(item.top - position) <= 1);
+      if (anchor) updatePresentationHashForView(anchor.name);
     }
-  });
-  return nearest;
+  };
+  presentationScrollFrame = window.requestAnimationFrame(step);
 }
 
-function getNextPresentationAnchorIndex(anchors, current, direction) {
-  const anchorTolerance = Math.max(12, window.innerHeight * 0.025);
-  const nearest = nearestPresentationAnchorIndex(anchors, current);
-  const nearestAnchor = anchors[nearest];
-  const atAnchor = Math.abs(nearestAnchor.top - current) <= anchorTolerance;
-
-  if (atAnchor) {
-    return clamp(nearest + (direction === "down" ? 1 : -1), 0, anchors.length - 1);
-  }
-
-  if (direction === "down") {
-    const next = anchors.findIndex((anchor) => anchor.top > current + anchorTolerance);
-    return next === -1 ? anchors.length - 1 : next;
-  }
-
-  for (let index = anchors.length - 1; index >= 0; index -= 1) {
-    if (anchors[index].top < current - anchorTolerance) return index;
-  }
-  return 0;
-}
-
-function maybeHoldPresentationWheel(event) {
-  if (!document.body.classList.contains("presentation-mode")) return;
+function handlePresentationWheel(event) {
+  if (!document.body.classList.contains("presentation-mode") || event.defaultPrevented) return;
+  if (event.ctrlKey || event.metaKey || event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+  if (!event.deltaY || !event.cancelable) return;
   const target = event.target instanceof Element ? event.target : null;
-  if (getInternalScrollTarget(target, event.deltaY)) return;
-
-  const direction = event.deltaY > 0 ? "down" : event.deltaY < 0 ? "up" : null;
-  if (!direction) return;
+  const overlayOpen = appState.historyOverlayOpen || document.getElementById("liveSetupModal")?.hidden === false;
+  if (overlayOpen || getInternalScrollTarget(target, event.deltaY)) {
+    cancelPresentationScroll();
+    if (overlayOpen && !getInternalScrollTarget(target, event.deltaY)) event.preventDefault();
+    return;
+  }
+  if (reducedMotion.matches) return;
 
   event.preventDefault();
-  event.stopPropagation();
-
-  const now = performance.now();
-  if (now < presentationScrollHold.lockedUntil) return;
-
   const current = window.scrollY;
-  const anchors = getPresentationAnchorTops();
-  const currentIndex = nearestPresentationAnchorIndex(anchors, current);
-  const nextIndex = getNextPresentationAnchorIndex(anchors, current, direction);
-  const currentAnchor = anchors[currentIndex];
-  const nextAnchor = anchors[nextIndex];
-  if (!nextAnchor || nextIndex === currentIndex) return;
-
-  animatePresentationScrollTo(nextAnchor.top);
-  updatePresentationHashForView(nextAnchor.name);
-
-  presentationScrollHold.lockedUntil = now + presentationScrollDurationMs + presentationScrollSettleMs;
-  presentationScrollHold.targetName = nextAnchor.name;
+  // A manual wheel gesture also interrupts a navigation-button animation.
+  if (!presentationScroll.direction) cancelPresentationScroll();
+  presentationScroll.move(
+    wheelPixels(event, window.innerHeight), current, getPresentationAnchorTops(), window.innerHeight,
+    getPresentationLayout().maxScroll
+  );
+  continuePresentationScroll();
 }
 
 function letterizeLandingTitle() {
@@ -656,6 +737,7 @@ function setLiveSetupOpen(open) {
   if (!modal) return;
   modal.hidden = !open;
   if (open) {
+    cancelPresentationScroll();
     syncSeedVersionFields();
     document.getElementById("presentationSeedHost")?.focus();
   }
@@ -826,6 +908,9 @@ function renderPresentationDashboard() {
   const cardsTarget = document.getElementById("presentationDashboardCards");
   const eventsTarget = document.getElementById("presentationEventList");
   if (!cardsTarget || !eventsTarget) return;
+  const activeCard = cardsTarget.querySelector(".dashboard-card.is-interacting");
+  const activeTone = activeCard?.dataset.tone;
+  const activeReveal = Number(activeCard?.dataset.reveal || 0);
   renderDashboardOps();
 
   const managed = getManagedDevices();
@@ -843,7 +928,6 @@ function renderPresentationDashboard() {
       foot: `${warning} warning, ${down} down`,
       icon: "/assets/media/intelligent-iteration-icon.svg",
       bg: "#0c0c0c",
-      hoverBg: "#191919",
       fg: "#e9e9e9",
       detail: renderDashboardDeviceDetail()
     },
@@ -854,7 +938,6 @@ function renderPresentationDashboard() {
       foot: `${pendingLinks} pending`,
       icon: "/assets/media/financial-support-icon.svg",
       bg: "#66a3ad",
-      hoverBg: "#80bbc1",
       fg: "#080808"
     },
     {
@@ -864,7 +947,6 @@ function renderPresentationDashboard() {
       foot: `${counts.acknowledged} acknowledged`,
       icon: "/assets/media/full-stack-support-icon.svg",
       bg: "#f36b42",
-      hoverBg: "#ff825a",
       fg: "#080808",
       detail: renderDashboardAlertDetail()
     },
@@ -875,7 +957,6 @@ function renderPresentationDashboard() {
       foot: streamState,
       icon: "/assets/media/exponential-foresight-icon.svg",
       bg: "#e8e8e8",
-      hoverBg: "#f5f5f5",
       fg: "#080808",
       detail: renderDashboardEventDetail()
     }
@@ -885,14 +966,17 @@ function renderPresentationDashboard() {
     .map(
       (card) => `
         <article
-          class="dashboard-card"
+          class="dashboard-card${card.tone === activeTone ? " is-interacting" : ""}"
           data-tone="${card.tone}"
-          style="--card-bg:${card.bg};--card-hover-bg:${card.hoverBg};--card-fg:${card.fg};"
+          data-reveal="${card.tone === activeTone ? activeReveal : 0}"
+          style="--card-bg:${card.bg};--card-fg:${card.fg};"
         >
-          <h3 class="dashboard-card-title">${card.title}</h3>
-          <img class="dashboard-card-icon" src="${card.icon}" alt="" />
-          <strong class="dashboard-card-value">${escapeHtml(card.value)}</strong>
-          <span class="dashboard-card-foot">${escapeHtml(card.foot)}</span>
+          <div class="dashboard-card-summary">
+            <h3 class="dashboard-card-title">${card.title}</h3>
+            <img class="dashboard-card-icon" src="${card.icon}" alt="" />
+            <strong class="dashboard-card-value">${escapeHtml(card.value)}</strong>
+            <span class="dashboard-card-foot">${escapeHtml(card.foot)}</span>
+          </div>
           ${card.detail || ""}
         </article>
       `
@@ -1233,6 +1317,7 @@ function setHistoryOverlayOpen(open, updateHash = true) {
   appState.historyOverlayOpen = open;
   document.body.classList.toggle("history-overlay-open", open);
   if (open) {
+    cancelPresentationScroll();
     if (updateHash && window.location.hash !== "#history") {
       history.pushState(null, "", "#history");
     }
@@ -1402,8 +1487,6 @@ function bindDeviceCarousel() {
       currentX: event.clientX,
       moved: false
     };
-    track.classList.add("is-dragging");
-    track.setPointerCapture(event.pointerId);
   });
 
   track.addEventListener("pointermove", (event) => {
@@ -1411,7 +1494,12 @@ function bindDeviceCarousel() {
     const drag = appState.deviceCarouselDrag;
     if (!drag || drag.pointerId !== event.pointerId) return;
     drag.currentX = event.clientX;
-    if (Math.abs(drag.currentX - drag.startX) > 8) drag.moved = true;
+    if (!drag.moved && Math.abs(drag.currentX - drag.startX) > 8) {
+      drag.moved = true;
+      track.classList.add("is-dragging");
+      track.setPointerCapture(event.pointerId);
+    }
+    if (!drag.moved) return;
     updateDeviceCarousel(drag.currentX - drag.startX);
   });
 
@@ -1440,12 +1528,12 @@ function bindDeviceCarousel() {
   track.addEventListener("pointercancel", finishDrag);
   track.addEventListener("click", (event) => {
     if (event.target.closest("input, textarea, button, select, label, [data-mac-label-form]")) return;
-    const card = event.target.closest("[data-device-card]");
-    if (!card || !track.contains(card)) return;
     if (appState.deviceCarouselSuppressClick) {
       appState.deviceCarouselSuppressClick = false;
       return;
     }
+    const card = event.target.closest("[data-device-card]");
+    if (!card || !track.contains(card)) return;
     const index = Number(card.dataset.deviceIndex || 0);
     setSelectedDeviceIndex(index);
     const deviceId = card.dataset.deviceCardId || getDevices()[index]?.id;
@@ -1503,7 +1591,7 @@ function bindMacLabelForms(scope = document) {
 
 function getDashboardCardMaxReveal(card) {
   const row = card.closest(".dashboard-card-row");
-  if (!row || window.matchMedia("(max-width: 980px)").matches) return 0;
+  if (!row || !card.querySelector(".dashboard-card-detail") || window.matchMedia("(max-width: 980px)").matches) return 0;
   const visibleHeight = row.getBoundingClientRect().height || window.innerHeight * 0.58;
   const renderedHeight = card.getBoundingClientRect().height;
   const contentHeight = Math.max(card.scrollHeight, renderedHeight);
@@ -1517,6 +1605,7 @@ function setDashboardCardReveal(card, value) {
 }
 
 function activateDashboardCard(card, scope = document) {
+  if (card.classList.contains("is-interacting")) return;
   scope.querySelectorAll(".dashboard-card").forEach((otherCard) => {
     if (otherCard === card) return;
     otherCard.classList.remove("is-interacting");
@@ -1526,6 +1615,7 @@ function activateDashboardCard(card, scope = document) {
 }
 
 function deactivateDashboardCard(card) {
+  if (!card.classList.contains("is-interacting")) return;
   card.classList.remove("is-interacting");
   setDashboardCardReveal(card, 0);
 }
@@ -1538,12 +1628,16 @@ function bindDashboardCardReveal(scope = document) {
     card.addEventListener(
       "wheel",
       (event) => {
+        if (event.ctrlKey || event.metaKey || event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+        const dashboard = card.closest(".dashboard-showcase");
+        if (dashboard && Math.abs(window.scrollY - dashboard.offsetTop) > 2) return;
         activateDashboardCard(card, scope);
         const current = Number(card.dataset.reveal || 0);
-        const next = current + event.deltaY * 0.7;
+        const next = current + wheelPixels(event, window.innerHeight) * 0.7;
         const maxReveal = getDashboardCardMaxReveal(card);
         const bounded = clamp(next, 0, maxReveal);
         if (bounded !== current) {
+          cancelPresentationScroll();
           event.preventDefault();
           event.stopPropagation();
           setDashboardCardReveal(card, bounded);
@@ -1551,10 +1645,6 @@ function bindDashboardCardReveal(scope = document) {
       },
       { passive: false }
     );
-    card.addEventListener("pointerenter", () => activateDashboardCard(card, scope));
-    card.addEventListener("mouseenter", () => activateDashboardCard(card, scope));
-    card.addEventListener("pointerleave", () => deactivateDashboardCard(card));
-    card.addEventListener("mouseleave", () => deactivateDashboardCard(card));
   });
   if (scope.dataset.revealScopeBound !== "true") {
     scope.dataset.revealScopeBound = "true";
@@ -1562,15 +1652,17 @@ function bindDashboardCardReveal(scope = document) {
       const card = event.target.closest(".dashboard-card");
       if (card && scope.contains(card)) activateDashboardCard(card, scope);
     });
-    scope.addEventListener("mouseover", (event) => {
+    scope.addEventListener("focusin", (event) => {
       const card = event.target.closest(".dashboard-card");
       if (card && scope.contains(card)) activateDashboardCard(card, scope);
     });
     scope.addEventListener("pointerleave", () => {
       scope.querySelectorAll(".dashboard-card").forEach((card) => deactivateDashboardCard(card));
     });
-    scope.addEventListener("mouseleave", () => {
-      scope.querySelectorAll(".dashboard-card").forEach((card) => deactivateDashboardCard(card));
+    scope.addEventListener("focusout", (event) => {
+      if (!scope.contains(event.relatedTarget) && !scope.matches(":hover")) {
+        scope.querySelectorAll(".dashboard-card").forEach((card) => deactivateDashboardCard(card));
+      }
     });
   }
 }
@@ -1746,13 +1838,14 @@ function renderTopology() {
       const x2 = to.x + nodeWidth / 2;
       const y2 = to.y + nodeHeight / 2;
       const stroke = link.status === "confirmed" ? "#1c7f5a" : "#a76505";
+      const isManagementLink = link.directness === "management" || link.link_type === "management";
       const dash = link.line_style === "solid" || link.status === "confirmed" ? "0" : "8 7";
       const opacity = Math.max(0.35, Math.min(1, Number(link.confidence || 45) / 100));
-      const label = [link.local_port, link.remote_port].filter(Boolean).join(" -> ");
+      const label = `${isManagementLink ? "MGMT · " : ""}${[link.local_port, link.remote_port].filter(Boolean).join(" -> ")}`;
       const labelSvg = label
         ? `<text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 8}" class="link-label">${escapeHtml(label)}</text>`
         : "";
-      return `<g><title>${escapeHtml(topologyLinkTitle(link))}</title><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="3" stroke-opacity="${opacity}" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
+      return `<g data-link-type="${isManagementLink ? "management" : "network"}"><title>${escapeHtml(topologyLinkTitle(link))}</title><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${isManagementLink ? "#d45d39" : stroke}" stroke-width="3" stroke-opacity="${opacity}" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
     })
     .join("");
 
@@ -2628,13 +2721,14 @@ function renderShowcaseLinks() {
       const toBox = getStableLogicalNodeBox(to);
       const fromPoint = getEdgePoint(fromBox, toBox);
       const toPoint = getEdgePoint(toBox, fromBox);
+      const isManagementLink = link.directness === "management" || link.link_type === "management";
       const dash = link.line_style === "solid" || link.status === "confirmed" ? "0" : "8 7";
       const opacity = Math.max(0.35, Math.min(1, Number(link.confidence || 45) / 100));
-      const label = [link.local_port, link.remote_port].filter(Boolean).join(" -> ");
+      const label = `${isManagementLink ? "MGMT · " : ""}${[link.local_port, link.remote_port].filter(Boolean).join(" -> ")}`;
       const labelSvg = label
         ? `<text x="${(fromPoint.x + toPoint.x) / 2}" y="${(fromPoint.y + toPoint.y) / 2 - 7}" class="showcase-link-label">${escapeHtml(label)}</text>`
         : "";
-      return `<g data-link-from="${escapeHtml(link.from)}" data-link-to="${escapeHtml(link.to)}"><title>${escapeHtml(topologyLinkTitle(link))}</title><line x1="${fromPoint.x}" y1="${fromPoint.y}" x2="${toPoint.x}" y2="${toPoint.y}" stroke="#263746" stroke-width="2" stroke-opacity="${opacity}" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
+      return `<g data-link-from="${escapeHtml(link.from)}" data-link-to="${escapeHtml(link.to)}" data-link-type="${isManagementLink ? "management" : "network"}"><title>${escapeHtml(topologyLinkTitle(link))}</title><line x1="${fromPoint.x}" y1="${fromPoint.y}" x2="${toPoint.x}" y2="${toPoint.y}" stroke="${isManagementLink ? "#d45d39" : "#263746"}" stroke-width="${isManagementLink ? "3" : "2"}" stroke-opacity="${opacity}" stroke-dasharray="${dash}" stroke-linecap="round" />${labelSvg}</g>`;
     })
     .join("");
 }
@@ -2868,58 +2962,123 @@ function renderShowcaseTopology() {
   requestAnimationFrame(renderShowcaseLinks);
 }
 
-function startDotTunnel() {
-  const canvas = document.getElementById("dotTunnelCanvas");
-  if (!canvas || appState.tunnelAnimation) return;
+function startParticleOrb() {
+  const canvas = document.getElementById("particleOrbCanvas");
+  if (!canvas || appState.particleAnimation) return;
   const context = canvas.getContext("2d");
+  if (!context) return;
+  const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  const particleCount = isSafari ? 240 : 300;
+  const depthBuckets = Array.from({ length: 6 }, () => []);
+  const particles = Array.from({ length: particleCount }, (_, index) => {
+    // Fibonacci distribution avoids visible bands without randomizing on every refresh.
+    const y = 1 - ((index + 0.5) / particleCount) * 2;
+    const radial = Math.sqrt(Math.max(0, 1 - y * y));
+    const theta = index * Math.PI * (3 - Math.sqrt(5));
+    const shell = 0.38 + (((index * 73) % particleCount) / particleCount) * 0.62;
+    return {
+      x: Math.cos(theta) * radial * shell,
+      y: y * shell,
+      z: Math.sin(theta) * radial * shell,
+      screenX: 0,
+      screenY: 0,
+      size: 1,
+      bucket: 0
+    };
+  });
+  let visible = false;
+  let cssWidth = 1;
+  let cssHeight = 1;
+  let resizePending = true;
+  let lastDraw = -Infinity;
+  const targetFrameMs = 1000 / 30;
 
-  function draw(time) {
-    const rect = canvas.getBoundingClientRect();
-    const scale = window.devicePixelRatio || 1;
-    const nextWidth = Math.max(1, Math.round(rect.width * scale));
-    const nextHeight = Math.max(1, Math.round(rect.height * scale));
-    if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
-      canvas.width = nextWidth;
-      canvas.height = nextHeight;
+  canvas.dataset.renderer = "particle-orb-canvas";
+  canvas.dataset.particleCount = String(particleCount);
+  canvas.dataset.targetFps = "30";
+
+  function requestDraw() {
+    if (visible && !document.hidden && !appState.particleAnimation) {
+      appState.particleAnimation = window.requestAnimationFrame(draw);
     }
-
-    const width = canvas.width;
-    const height = canvas.height;
-    const cx = width * 0.55;
-    const cy = height * 0.55;
-    const t = time * 0.00008;
-    context.clearRect(0, 0, width, height);
-    context.save();
-    context.scale(scale, scale);
-
-    const cssWidth = width / scale;
-    const cssHeight = height / scale;
-    const centerX = cssWidth * 0.55;
-    const centerY = cssHeight * 0.55;
-
-    for (let ring = 0; ring < 34; ring += 1) {
-      const depth = ((ring / 34) + t) % 1;
-      const radius = 36 + depth * Math.max(cssWidth, cssHeight) * 0.72;
-      const points = 48 + Math.round(depth * 72);
-      const alpha = 0.05 + depth * 0.26;
-      const dot = 0.55 + depth * 1.35;
-      context.fillStyle = `rgba(35, 39, 43, ${alpha})`;
-      for (let point = 0; point < points; point += 1) {
-        const angle = (point / points) * Math.PI * 2 + t * 1.7 + depth * 1.2;
-        const x = centerX + Math.cos(angle) * radius * 1.58;
-        const y = centerY + Math.sin(angle) * radius * 0.48;
-        if (x < -10 || x > cssWidth + 10 || y < -10 || y > cssHeight + 10) continue;
-        context.beginPath();
-        context.arc(x, y, dot, 0, Math.PI * 2);
-        context.fill();
-      }
-    }
-
-    context.restore();
-    appState.tunnelAnimation = window.requestAnimationFrame(draw);
   }
 
-  appState.tunnelAnimation = window.requestAnimationFrame(draw);
+  updateParticleVisibility = (nextVisible) => {
+    if (visible === nextVisible) return;
+    visible = nextVisible;
+    if (visible) {
+      lastDraw = -Infinity;
+      requestDraw();
+    } else {
+      window.cancelAnimationFrame(appState.particleAnimation);
+      appState.particleAnimation = null;
+    }
+  };
+
+  new ResizeObserver(([entry]) => {
+    cssWidth = Math.max(1, entry.contentRect.width);
+    cssHeight = Math.max(1, entry.contentRect.height);
+    resizePending = true;
+    requestDraw();
+  }).observe(canvas);
+  reducedMotion.addEventListener("change", requestDraw);
+
+  function draw(time) {
+    appState.particleAnimation = null;
+    if (!visible || document.hidden) return;
+    if (!resizePending && !reducedMotion.matches && time - lastDraw < targetFrameMs - 1) {
+      requestDraw();
+      return;
+    }
+    lastDraw = time;
+    const scale = Math.min(window.devicePixelRatio || 1, isSafari ? 1.25 : 1.5);
+    if (resizePending) {
+      canvas.width = Math.round(cssWidth * scale);
+      canvas.height = Math.round(cssHeight * scale);
+      resizePending = false;
+    }
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    context.clearRect(0, 0, cssWidth, cssHeight);
+    const t = reducedMotion.matches ? 0 : time * (Math.PI * 2 / 18000);
+    const sinY = Math.sin(t);
+    const cosY = Math.cos(t);
+    const sinX = Math.sin(t * 0.43 + 0.6);
+    const cosX = Math.cos(t * 0.43 + 0.6);
+    const centerX = cssWidth * 0.48;
+    const centerY = cssHeight * 0.53;
+    const radiusX = Math.max(cssWidth * 0.52, cssHeight * 0.6);
+    const radiusY = cssHeight * 0.64;
+
+    depthBuckets.forEach((bucket) => { bucket.length = 0; });
+    for (const particle of particles) {
+      const rotatedX = particle.x * cosY - particle.z * sinY;
+      const rotatedZ = particle.x * sinY + particle.z * cosY;
+      const rotatedY = particle.y * cosX - rotatedZ * sinX;
+      const depthZ = particle.y * sinX + rotatedZ * cosX;
+      const perspective = 1 / (1.34 - depthZ * 0.34);
+      particle.screenX = centerX + rotatedX * radiusX * perspective;
+      particle.screenY = centerY + rotatedY * radiusY * perspective;
+      particle.size = 0.7 + perspective * 1.25;
+      particle.bucket = Math.max(0, Math.min(depthBuckets.length - 1, Math.floor((depthZ + 1) * 3)));
+      depthBuckets[particle.bucket].push(particle);
+    }
+
+    depthBuckets.forEach((bucket, bucketIndex) => {
+      const alpha = 0.09 + bucketIndex * 0.032;
+      context.fillStyle = `rgba(63, 66, 67, ${alpha})`;
+      context.beginPath();
+      for (const particle of bucket) {
+        if (
+          particle.screenX < -8 || particle.screenX > cssWidth + 8
+          || particle.screenY < -8 || particle.screenY > cssHeight + 8
+        ) continue;
+        context.moveTo(particle.screenX + particle.size, particle.screenY);
+        context.arc(particle.screenX, particle.screenY, particle.size, 0, Math.PI * 2);
+      }
+      context.fill();
+    });
+    if (!reducedMotion.matches) requestDraw();
+  }
 }
 
 function renderAlerts() {
@@ -3288,16 +3447,35 @@ function bindEvents() {
     await setBackendPolling(document.getElementById("autoPollToggle").checked, 30);
   });
   window.addEventListener("resize", () => {
+    cancelPresentationScroll();
+    presentationLayout = null;
     renderTopology();
     renderShowcaseTopology();
     updateDeviceCarousel();
     updatePresentationProgress();
   });
   window.addEventListener("scroll", () => {
-    updatePresentationProgress();
-    resetPresentationScrollHoldIfAwayFromAnchor();
+    if (Math.abs(window.scrollY - presentationWrittenTop) > 2) cancelPresentationScroll();
+    if (!presentationScrollFrame) schedulePresentationProgress();
   }, { passive: true });
-  window.addEventListener("wheel", maybeHoldPresentationWheel, { passive: false });
+  const layoutObserver = new ResizeObserver(() => {
+    presentationLayout = null;
+    schedulePresentationProgress();
+  });
+  document.querySelectorAll(".landing-view, .map-showcase, .pattern-break, .dashboard-showcase, .devices-showcase")
+    .forEach((section) => layoutObserver.observe(section));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      cancelPresentationScroll();
+      updateParticleVisibility(false);
+    } else {
+      schedulePresentationProgress();
+    }
+  });
+  window.addEventListener("wheel", handlePresentationWheel, { passive: false });
+  window.addEventListener("pointerdown", cancelPresentationScroll, { passive: true });
+  window.addEventListener("touchstart", cancelPresentationScroll, { passive: true });
+  reducedMotion.addEventListener("change", cancelPresentationScroll);
   window.addEventListener("hashchange", () => {
     const view = window.location.hash.replace("#", "");
     if (view === "history") {
@@ -3308,6 +3486,9 @@ function bindEvents() {
     }
   });
   window.addEventListener("keydown", (event) => {
+    if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
+      cancelPresentationScroll();
+    }
     if (event.key === "Escape" && appState.historyOverlayOpen) {
       setHistoryOverlayOpen(false);
     }
@@ -3334,9 +3515,10 @@ function connectEvents() {
   });
 }
 
+selectPatternBreakImage();
 letterizeLandingTitle();
 bindEvents();
-startDotTunnel();
+startParticleOrb();
 updatePresentationProgress();
 loadSnapshot().then(() => {
   connectEvents();
